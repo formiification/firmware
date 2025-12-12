@@ -7,7 +7,7 @@
 #include "airtime.h"
 #include "error.h"
 
-#define MAX_TX_QUEUE 16 // max number of packets which can be waiting for transmission
+#define MAX_TX_QUEUE 32 // max number of packets which can be waiting for transmission
 
 #define MAX_LORA_PAYLOAD_LEN 255 // max length of 255 per Semtech's datasheets on SX12xx
 #define MESHTASTIC_HEADER_LENGTH 16
@@ -221,7 +221,7 @@ class RadioInterface
     static bool uses_default_frequency_slot;
 
   protected:
-    int8_t power = 17; // Set by applyModemConfig()
+    int8_t power = 30; // Set by applyModemConfig()
 
     float savedFreq;
     uint32_t savedChannelNum;

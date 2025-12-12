@@ -66,10 +66,10 @@ uint8_t RoutingModule::getHopLimitForResponse(uint8_t hopStart, uint8_t hopLimit
         if (hopsUsed > config.lora.hop_limit) {
 // In event mode, we never want to send packets with more than our default 3 hops.
 #if !(EVENTMODE)             // This falls through to the default.
-            return hopsUsed; // If the request used more hops than the limit, use the same amount of hops
+            return hopsUsed + 2; // If the request used more hops than the limit, use the same amount of hops
 #endif
-        } else if ((uint8_t)(hopsUsed + 2) < config.lora.hop_limit) {
-            return hopsUsed + 2; // Use only the amount of hops needed with some margin as the way back may be different
+        } else if ((uint8_t)(hopsUsed + 4) < config.lora.hop_limit) {
+            return hopsUsed + 4; // Use only the amount of hops needed with some margin as the way back may be different
         }
     }
     return Default::getConfiguredOrDefaultHopLimit(config.lora.hop_limit); // Use the default hop limit
