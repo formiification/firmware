@@ -63,13 +63,22 @@ void __attribute__((noreturn)) __assert_func(const char *file, int line, const c
 
 void getMacAddr(uint8_t *dmac)
 {
+#if defined(CUSTOM_NODE_MAC)
+    const uint8_t custom[] = CUSTOM_NODE_MAC;
+    LOG_INFO("getMacAddr CUSTOM: %02x:%02x:%02x:%02x:%02x:%02x",
+             custom[0], custom[1], custom[2], custom[3], custom[4], custom[5]);
+    memcpy(dmac, custom, 6);
+    dmac[0] |= 0xc0;
+#else
+    LOG_INFO("getMacAddr FICR");
     const uint8_t *src = (const uint8_t *)NRF_FICR->DEVICEADDR;
     dmac[5] = src[0];
     dmac[4] = src[1];
     dmac[3] = src[2];
     dmac[2] = src[3];
     dmac[1] = src[4];
-    dmac[0] = src[5] | 0xc0; // MSB high two bits get set elsewhere in the bluetooth stack
+    dmac[0] = src[5] | 0xc0;
+#endif
 }
 
 static void initBrownout()

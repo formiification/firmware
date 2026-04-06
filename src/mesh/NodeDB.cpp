@@ -1084,6 +1084,9 @@ void NodeDB::installDefaultDeviceState()
 
     generatePacketId(); // FIXME - ugly way to init current_packet_id;
 
+    // czyścimy nodeid v2
+    myNodeInfo.my_node_num = 0;
+
     // Set default owner name
     pickNewNodeNum(); // based on macaddr now
 #ifdef USERPREFS_CONFIG_OWNER_LONG_NAME

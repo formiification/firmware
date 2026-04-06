@@ -247,6 +247,27 @@ void NRF52Bluetooth::setup()
     Bluefruit.autoConnLed(false);
     Bluefruit.configPrphBandwidth(BANDWIDTH_MAX);
     Bluefruit.begin();
+
+// CUSTOM NODEIDv2
+
+#if defined(CUSTOM_NODE_MAC)
+    {
+        const uint8_t mac[] = CUSTOM_NODE_MAC;
+        ble_gap_addr_t addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.addr_type = BLE_GAP_ADDR_TYPE_RANDOM_STATIC;
+        for (int i = 0; i < 6; i++)
+            addr.addr[i] = mac[5 - i];
+        addr.addr[5] |= 0xC0;
+        uint32_t err = sd_ble_gap_addr_set(&addr);
+        if (err != NRF_SUCCESS) {
+            LOG_ERROR("BLE custom addr set failed: 0x%lx", err);
+        } else {
+            LOG_INFO("BLE custom addr set OK");
+        }
+    }
+#endif
+
     // Clear existing data.
     Bluefruit.Advertising.stop();
     Bluefruit.Advertising.clearData();
