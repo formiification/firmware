@@ -1,6 +1,7 @@
 #include "configuration.h"
 #if !MESHTASTIC_EXCLUDE_WEBSERVER
 #include "NodeDB.h"
+#include "UptimeClock.h"
 #include "graphics/Screen.h"
 #include "main.h"
 #include "mesh/http/WebServer.h"
@@ -9,12 +10,12 @@
 #include <HTTPBodyParser.hpp>
 #include <HTTPMultipartBodyParser.hpp>
 #include <HTTPURLEncodedBodyParser.hpp>
+#include <Throttle.h>
 #include <WebServer.h>
 #include <WiFi.h>
 
-#if HAS_ETHERNET && defined(USE_WS5500)
-#include <ETHClass2.h>
-#define ETH ETH2
+#if HAS_ETHERNET && defined(ARCH_ESP32)
+#include <ETH.h>
 #endif // HAS_ETHERNET
 
 #ifdef ARCH_ESP32
@@ -55,8 +56,39 @@ static const int32_t ACTIVE_INTERVAL_MS = 50;
 static const int32_t MEDIUM_INTERVAL_MS = 200;
 static const int32_t IDLE_INTERVAL_MS = 1000;
 
+// Maximum concurrent HTTPS connections (reduced from default 4 to save memory)
+static const uint8_t MAX_HTTPS_CONNECTIONS = 2;
+
+// Minimum free heap required for SSL handshake (~40KB for mbedTLS contexts)
+static const uint32_t MIN_HEAP_FOR_SSL = 40000;
+
+// HTTPSServer that can service and reap the connections it already holds without accepting new ones,
+// so a low-heap pause doesn't freeze open TLS sessions (and their heap) in place. Needs the protected table.
+class MeshHTTPSServer : public HTTPSServer
+{
+  public:
+    using HTTPSServer::HTTPSServer;
+
+    /// The first half of HTTPServer::loop(): drive and reap existing connections, accept nothing.
+    void serviceExistingConnections()
+    {
+        if (!_running)
+            return;
+        for (uint8_t i = 0; i < _maxConnections; i++) {
+            if (!_connections[i])
+                continue;
+            if (_connections[i]->isClosed()) {
+                delete _connections[i];
+                _connections[i] = nullptr;
+            } else {
+                _connections[i]->loop();
+            }
+        }
+    }
+};
+
 static SSLCert *cert;
-static HTTPSServer *secureServer;
+static MeshHTTPSServer *secureServer;
 static HTTPServer *insecureServer;
 
 volatile bool isWebServerReady;
@@ -67,8 +99,22 @@ static void handleWebResponse()
     if (isWifiAvailable()) {
 
         if (isWebServerReady) {
-            if (secureServer)
-                secureServer->loop();
+            // Check heap before HTTPS processing - SSL requires significant memory
+            if (secureServer) {
+                uint32_t freeHeap = ESP.getFreeHeap();
+                if (freeHeap >= MIN_HEAP_FOR_SSL) {
+                    secureServer->loop();
+                } else {
+                    // Low heap: accept nothing new, but keep servicing open connections so they can time out
+                    // and free their contexts - skipping them pins the heap below the threshold for good.
+                    secureServer->serviceExistingConnections();
+                    static uint32_t lastHeapWarning = 0;
+                    if (lastHeapWarning == 0 || !Throttle::isWithinTimespanMs(lastHeapWarning, 30000)) {
+                        LOG_WARN("Low heap (%u bytes), not accepting HTTPS connections", freeHeap);
+                        lastHeapWarning = millis();
+                    }
+                }
+            }
             insecureServer->loop();
         }
     }
@@ -78,21 +124,13 @@ static void taskCreateCert(void *parameter)
 {
     prefs.begin("MeshtasticHTTPS", false);
 
-#if 0
-    // Delete the saved certs (used in debugging)
-    LOG_DEBUG("Delete any saved SSL keys");
-    // prefs.clear();
-    prefs.remove("PK");
-    prefs.remove("cert");
-#endif
-
     LOG_INFO("Checking if we have a saved SSL Certificate");
 
     size_t pkLen = prefs.getBytesLength("PK");
     size_t certLen = prefs.getBytesLength("cert");
 
     if (pkLen && certLen) {
-        LOG_INFO("Existing SSL Certificate found!");
+        LOG_INFO("Existing SSL Certificate found");
 
         uint8_t *pkBuffer = new uint8_t[pkLen];
         prefs.getBytes("PK", pkBuffer, pkLen);
@@ -170,7 +208,7 @@ void createSSLCert()
                 runLoop = true;
             }
         }
-        LOG_INFO("SSL Cert Ready!");
+        LOG_INFO("SSL Cert Ready");
     }
 }
 
@@ -181,28 +219,19 @@ WebServerThread::WebServerThread() : concurrency::OSThread("WebServer")
     if (!config.network.wifi_enabled && !config.network.eth_enabled) {
         disable();
     }
-    lastActivityTime = millis();
+    lastActivityTime = Time::getMillis();
 }
 
 void WebServerThread::markActivity()
 {
-    lastActivityTime = millis();
+    lastActivityTime = Time::getMillis();
 }
 
 int32_t WebServerThread::getAdaptiveInterval()
 {
-    uint32_t currentTime = millis();
-    uint32_t timeSinceActivity;
-
-    if (currentTime >= lastActivityTime) {
-        timeSinceActivity = currentTime - lastActivityTime;
-    } else {
-        timeSinceActivity = (UINT32_MAX - lastActivityTime) + currentTime + 1;
-    }
-
-    if (timeSinceActivity < ACTIVE_THRESHOLD_MS) {
+    if (Throttle::isWithinTimespanMs(lastActivityTime, ACTIVE_THRESHOLD_MS)) {
         return ACTIVE_INTERVAL_MS;
-    } else if (timeSinceActivity < MEDIUM_THRESHOLD_MS) {
+    } else if (Throttle::isWithinTimespanMs(lastActivityTime, MEDIUM_THRESHOLD_MS)) {
         return MEDIUM_INTERVAL_MS;
     } else {
         return IDLE_INTERVAL_MS;
@@ -229,7 +258,7 @@ void initWebServer()
     LOG_DEBUG("Init Web Server");
 
     // We can now use the new certificate to setup our server as usual.
-    secureServer = new HTTPSServer(cert);
+    secureServer = new MeshHTTPSServer(cert, 443, MAX_HTTPS_CONNECTIONS);
     insecureServer = new HTTPServer();
 
     registerHandlers(insecureServer, secureServer);

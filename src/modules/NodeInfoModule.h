@@ -1,5 +1,6 @@
 #pragma once
 #include "ProtobufModule.h"
+#include <map>
 
 /**
  * NodeInfo module for sending/receiving NodeInfos into the mesh
@@ -18,10 +19,16 @@ class NodeInfoModule : public ProtobufModule<meshtastic_User>, private concurren
     NodeInfoModule();
 
     /**
-     * Send our NodeInfo into the mesh
+     * Send our NodeInfo into the mesh. True only when a packet was handed to the router.
      */
-    void sendOurNodeInfo(NodeNum dest = NODENUM_BROADCAST, bool wantReplies = false, uint8_t channel = 0,
+    bool sendOurNodeInfo(NodeNum dest = NODENUM_BROADCAST, bool wantReplies = false, uint8_t channel = 0,
                          bool _shorterTimeout = false);
+
+    /**
+     * Schedule an immediate NodeInfo periodic check.
+     * Used when external conditions change (for example time source quality).
+     */
+    void triggerImmediateNodeInfoCheck();
 
   protected:
     /** Called to handle a particular incoming message
@@ -41,8 +48,13 @@ class NodeInfoModule : public ProtobufModule<meshtastic_User>, private concurren
     virtual int32_t runOnce() override;
 
   private:
-    uint32_t lastSentToMesh = 0; // Last time we sent our NodeInfo to the mesh
     bool shorterTimeout = false;
+    bool suppressReplyForCurrentRequest = false;
+    /// Sender -> uptime seconds (Time::getUptimeSecs()) at our last reply. Seconds, not millis:
+    /// the suppression window is hours wide. See handleReceivedProtobuf().
+    std::map<NodeNum, uint32_t> lastNodeInfoSeen;
+
+    void pruneLastNodeInfoCache();
 };
 
 extern NodeInfoModule *nodeInfoModule;

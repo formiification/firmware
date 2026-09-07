@@ -142,8 +142,9 @@ void VirtualKeyboard::draw(OLEDDisplay *display, int16_t offsetX, int16_t offset
         if (keyboardStartY < 0)
             keyboardStartY = 0;
     } else {
-        // Default (non-wide, non-64px) behavior: use key height heuristic and place at bottom
-        cellH = KEY_HEIGHT;
+        // Default (non-wide, non-64px) e.g. SH1107 128x128:
+        // cellH = FONT_HEIGHT_SMALL - 2 so rows are tighter while still hosting the font
+        cellH = std::max((int)KEY_HEIGHT, FONT_HEIGHT_SMALL - 2);
         int keyboardHeight = KEYBOARD_ROWS * cellH;
         keyboardStartY = screenH - keyboardHeight;
         if (keyboardStartY < 0)
@@ -354,8 +355,6 @@ void VirtualKeyboard::drawInputArea(OLEDDisplay *display, int16_t offsetX, int16
         if (screenHeight <= 64) {
             textY = boxY + (boxHeight - inputLineH) / 2;
         } else {
-            const int innerLeft = boxX + 1;
-            const int innerRight = boxX + boxWidth - 2;
             const int innerTop = boxY + 1;
             const int innerBottom = boxY + boxHeight - 2;
 
@@ -431,6 +430,10 @@ void VirtualKeyboard::drawKey(OLEDDisplay *display, const VirtualKey &key, bool 
             c = c - 'a' + 'A';
         }
         keyText = (key.character == ' ' || key.character == '_') ? "_" : std::string(1, c);
+        // Show the common "/" pairing next to "?" like on a real keyboard
+        if (key.type == VK_CHAR && key.character == '?') {
+            keyText = "?/";
+        }
     }
 
     int textWidth = display->getStringWidth(keyText.c_str());
@@ -444,11 +447,8 @@ void VirtualKeyboard::drawKey(OLEDDisplay *display, const VirtualKey &key, bool 
         if (textX < x)
             textX = x; // guard
     } else {
-        if (display->getHeight() <= 64 && (key.character >= '0' && key.character <= '9')) {
-            textX = x + (width - textWidth + 1) / 2;
-        } else {
-            textX = x + (width - textWidth) / 2;
-        }
+        // Use ceil rounding for all screens (consistent with 128x64 behavior for numbers)
+        textX = x + (width - textWidth + 1) / 2;
     }
     int contentTop = y;
     int contentH = height;
@@ -520,9 +520,13 @@ char VirtualKeyboard::getCharForKey(const VirtualKey &key, bool isLongPress)
 
     char c = key.character;
 
-    // Long-press: only keep letter lowercase->uppercase conversion; remove other symbol mappings
-    if (isLongPress && c >= 'a' && c <= 'z') {
-        c = (char)(c - 'a' + 'A');
+    // Long-press: letters become uppercase; for "?" provide "/" like a typical keyboard
+    if (isLongPress) {
+        if (c >= 'a' && c <= 'z') {
+            c = (char)(c - 'a' + 'A');
+        } else if (c == '?') {
+            c = '/';
+        }
     }
 
     return c;
@@ -662,7 +666,13 @@ void VirtualKeyboard::handleLongPress()
         break;
     case VK_ESC:
         if (onTextEntered) {
-            onTextEntered("");
+            // Copy-and-clear before invoking, like handlePress/submitText: the callback can
+            // destroy this keyboard (OnScreenKeyboardModule::stop), so the member must not be
+            // the std::function still executing on the stack.
+            std::function<void(const std::string &)> callback = onTextEntered;
+            onTextEntered = nullptr;
+            inputText = "";
+            callback("");
         }
         break;
     default:
@@ -712,11 +722,6 @@ void VirtualKeyboard::submitText()
 void VirtualKeyboard::setInputText(const std::string &text)
 {
     inputText = text;
-}
-
-std::string VirtualKeyboard::getInputText() const
-{
-    return inputText;
 }
 
 void VirtualKeyboard::setHeader(const std::string &header)

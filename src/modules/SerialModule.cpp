@@ -3,9 +3,9 @@
 #include "MeshService.h"
 #include "NMEAWPL.h"
 #include "NodeDB.h"
-#include "RTC.h"
 #include "Router.h"
 #include "configuration.h"
+#include "gps/RTC.h"
 #include <Arduino.h>
 #include <Throttle.h>
 
@@ -49,6 +49,30 @@
 #include "meshSolarApp.h"
 #endif
 
+// Outside the architecture guard on purpose: config validation, not serial I/O. See SerialModule.h.
+bool serialConfigIsValid(const meshtastic_ModuleConfig_SerialConfig &config)
+{
+    if (config.override_console_serial_port && !IS_ONE_OF(config.mode, meshtastic_ModuleConfig_SerialConfig_Serial_Mode_NMEA,
+                                                          meshtastic_ModuleConfig_SerialConfig_Serial_Mode_CALTOPO,
+                                                          meshtastic_ModuleConfig_SerialConfig_Serial_Mode_MS_CONFIG)) {
+        const char *warning = "Invalid Serial config: override console serial port is only supported in NMEA, CalTopo, or MS "
+                              "Config output-only modes.";
+        LOG_ERROR(warning);
+#ifndef PIO_UNIT_TESTING
+        meshtastic_ClientNotification *cn = clientNotificationPool.allocZeroed();
+        if (cn) {
+            cn->level = meshtastic_LogRecord_Level_ERROR;
+            cn->time = getValidTime(RTCQualityFromNet);
+            snprintf(cn->message, sizeof(cn->message), "%s", warning);
+            service->sendClientNotification(cn);
+        }
+#endif
+        return false;
+    }
+
+    return true;
+}
+
 #if (defined(ARCH_ESP32) || defined(ARCH_NRF52) || defined(ARCH_RP2040) || defined(ARCH_STM32WL)) &&                             \
     !defined(CONFIG_IDF_TARGET_ESP32S2) && !defined(CONFIG_IDF_TARGET_ESP32C3)
 
@@ -63,53 +87,30 @@
 SerialModule *serialModule;
 SerialModuleRadio *serialModuleRadio;
 
-#if defined(TTGO_T_ECHO) || defined(CANARYONE) || defined(MESHLINK) || defined(ELECROW_ThinkNode_M1) ||                          \
-    defined(ELECROW_ThinkNode_M5) || defined(HELTEC_MESH_SOLAR) || defined(T_ECHO_LITE) || defined(ELECROW_ThinkNode_M3) ||      \
-    defined(MUZI_BASE)
-SerialModule::SerialModule() : StreamAPI(&Serial), concurrency::OSThread("Serial")
-{
-    api_type = TYPE_SERIAL;
-}
-static Print *serialPrint = &Serial;
-#elif defined(CONFIG_IDF_TARGET_ESP32C6) || defined(RAK3172) || defined(EBYTE_E77_MBL)
-SerialModule::SerialModule() : StreamAPI(&Serial1), concurrency::OSThread("Serial")
-{
-    api_type = TYPE_SERIAL;
-}
-static Print *serialPrint = &Serial1;
-#else
-SerialModule::SerialModule() : StreamAPI(&Serial2), concurrency::OSThread("Serial")
-{
-    api_type = TYPE_SERIAL;
-}
-static Print *serialPrint = &Serial2;
+#ifndef SERIAL_PRINT_PORT
+#define SERIAL_PRINT_PORT 2
 #endif
+
+#if SERIAL_PRINT_PORT == 0
+#define SERIAL_PRINT_OBJECT Serial
+#elif SERIAL_PRINT_PORT == 1
+#define SERIAL_PRINT_OBJECT Serial1
+#elif SERIAL_PRINT_PORT == 2
+#define SERIAL_PRINT_OBJECT Serial2
+#else
+#error "Unsupported SERIAL_PRINT_PORT value. Allowed values are 0, 1, or 2."
+#endif
+
+SerialModule::SerialModule() : StreamAPI(&SERIAL_PRINT_OBJECT), concurrency::OSThread("Serial")
+{
+    api_type = TYPE_SERIAL;
+}
+static Print *serialPrint = &SERIAL_PRINT_OBJECT;
 
 char serialBytes[512];
 size_t serialPayloadSize;
 
-bool SerialModule::isValidConfig(const meshtastic_ModuleConfig_SerialConfig &config)
-{
-    if (config.override_console_serial_port && !IS_ONE_OF(config.mode, meshtastic_ModuleConfig_SerialConfig_Serial_Mode_NMEA,
-                                                          meshtastic_ModuleConfig_SerialConfig_Serial_Mode_CALTOPO,
-                                                          meshtastic_ModuleConfig_SerialConfig_Serial_Mode_MS_CONFIG)) {
-        const char *warning =
-            "Invalid Serial config: override console serial port is only supported in NMEA and CalTopo output-only modes.";
-        LOG_ERROR(warning);
-#if !IS_RUNNING_TESTS
-        meshtastic_ClientNotification *cn = clientNotificationPool.allocZeroed();
-        cn->level = meshtastic_LogRecord_Level_ERROR;
-        cn->time = getValidTime(RTCQualityFromNet);
-        snprintf(cn->message, sizeof(cn->message), "%s", warning);
-        service->sendClientNotification(cn);
-#endif
-        return false;
-    }
-
-    return true;
-}
-
-SerialModuleRadio::SerialModuleRadio() : MeshModule("SerialModuleRadio")
+SerialModuleRadio::SerialModuleRadio() : SinglePortModule("SerialModuleRadio", meshtastic_PortNum_SERIAL_APP)
 {
     switch (moduleConfig.serial.mode) {
     case meshtastic_ModuleConfig_SerialConfig_Serial_Mode_TEXTMSG:
@@ -204,8 +205,8 @@ int32_t SerialModule::runOnce()
                 Serial.begin(baud);
                 Serial.setTimeout(moduleConfig.serial.timeout > 0 ? moduleConfig.serial.timeout : TIMEOUT);
             }
-#elif !defined(TTGO_T_ECHO) && !defined(T_ECHO_LITE) && !defined(CANARYONE) && !defined(MESHLINK) &&                             \
-    !defined(ELECROW_ThinkNode_M1) && !defined(ELECROW_ThinkNode_M3) && !defined(ELECROW_ThinkNode_M5) && !defined(MUZI_BASE)
+#elif SERIAL_PRINT_PORT != 0
+
             if (moduleConfig.serial.rxd && moduleConfig.serial.txd) {
 #ifdef ARCH_RP2040
                 Serial2.setFIFOSize(RX_BUFFER);
@@ -252,17 +253,19 @@ int32_t SerialModule::runOnce()
                     uint32_t readIndex = 0;
                     const meshtastic_NodeInfoLite *tempNodeInfo = nodeDB->readNextMeshNode(readIndex);
                     while (tempNodeInfo != NULL) {
-                        if (tempNodeInfo->has_user && nodeDB->hasValidPosition(tempNodeInfo)) {
-                            printWPL(outbuf, sizeof(outbuf), tempNodeInfo->position, tempNodeInfo->user.long_name, true);
-                            serialPrint->printf("%s", outbuf);
+                        if (nodeInfoLiteHasUser(tempNodeInfo) && nodeDB->hasValidPosition(tempNodeInfo)) {
+                            meshtastic_PositionLite pos;
+                            if (nodeDB->copyNodePosition(tempNodeInfo->num, pos)) {
+                                printWPL(outbuf, sizeof(outbuf), pos, tempNodeInfo->long_name, true);
+                                serialPrint->printf("%s", outbuf);
+                            }
                         }
                         tempNodeInfo = nodeDB->readNextMeshNode(readIndex);
                     }
                 }
             }
 
-#if !defined(TTGO_T_ECHO) && !defined(T_ECHO_LITE) && !defined(CANARYONE) && !defined(MESHLINK) &&                               \
-    !defined(ELECROW_ThinkNode_M1) && !defined(ELECROW_ThinkNode_M3) && !defined(ELECROW_ThinkNode_M5) && !defined(MUZI_BASE)
+#if SERIAL_PRINT_PORT != 0
             else if ((moduleConfig.serial.mode == meshtastic_ModuleConfig_SerialConfig_Serial_Mode_WS85)) {
                 processWXSerial();
 
@@ -312,6 +315,8 @@ int32_t SerialModule::runOnce()
 void SerialModule::sendTelemetry(meshtastic_Telemetry m)
 {
     meshtastic_MeshPacket *p = router->allocForSending();
+    if (!p)
+        return;
     p->decoded.portnum = meshtastic_PortNum_TELEMETRY_APP;
     p->decoded.payload.size =
         pb_encode_to_bytes(p->decoded.payload.bytes, sizeof(p->decoded.payload.bytes), &meshtastic_Telemetry_msg, &m);
@@ -327,18 +332,6 @@ void SerialModule::sendTelemetry(meshtastic_Telemetry m)
 }
 
 /**
- * Allocates a new mesh packet for use as a reply to a received packet.
- *
- * @return A pointer to the newly allocated mesh packet.
- */
-meshtastic_MeshPacket *SerialModuleRadio::allocReply()
-{
-    auto reply = allocDataPacket(); // Allocate a packet for sending
-
-    return reply;
-}
-
-/**
  * Sends a payload to a specified destination node.
  *
  * @param dest The destination node number.
@@ -347,7 +340,9 @@ meshtastic_MeshPacket *SerialModuleRadio::allocReply()
 void SerialModuleRadio::sendPayload(NodeNum dest, bool wantReplies)
 {
     const meshtastic_Channel *ch = (boundChannel != NULL) ? &channels.getByName(boundChannel) : NULL;
-    meshtastic_MeshPacket *p = allocReply();
+    meshtastic_MeshPacket *p = allocDataPacket();
+    if (!p)
+        return;
     p->to = dest;
     if (ch != NULL) {
         p->channel = ch->index;
@@ -377,7 +372,7 @@ ProcessMessage SerialModuleRadio::handleReceived(const meshtastic_MeshPacket &mp
         }
 
         auto &p = mp.decoded;
-        // LOG_DEBUG("Received text msg self=0x%0x, from=0x%0x, to=0x%0x, id=%d, msg=%.*s",
+        // LOG_DEBUG("Received text msg self=0x%08x, from=0x%08x, to=0x%08x, id=%d, msg=%.*s",
         //          nodeDB->getNodeNum(), mp.from, mp.to, mp.id, p.payload.size, p.payload.bytes);
 
         if (isFromUs(&mp)) {
@@ -394,7 +389,7 @@ ProcessMessage SerialModuleRadio::handleReceived(const meshtastic_MeshPacket &mp
                     lastRxID = mp.id;
                     // LOG_DEBUG("* * Message came this device");
                     // serialPrint->println("* * Message came this device");
-                    serialPrint->printf("%s", p.payload.bytes);
+                    serialPrint->printf("%.*s", (int)p.payload.size, p.payload.bytes);
                 }
             }
         } else {
@@ -404,9 +399,9 @@ ProcessMessage SerialModuleRadio::handleReceived(const meshtastic_MeshPacket &mp
                 serialPrint->write(p.payload.bytes, p.payload.size);
             } else if (moduleConfig.serial.mode == meshtastic_ModuleConfig_SerialConfig_Serial_Mode_TEXTMSG) {
                 meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(getFrom(&mp));
-                const char *sender = (node && node->has_user) ? node->user.short_name : "???";
+                const char *sender = nodeInfoLiteHasUser(node) ? node->short_name : "???";
                 serialPrint->println();
-                serialPrint->printf("%s: %s", sender, p.payload.bytes);
+                serialPrint->printf("%s: %.*s", sender, (int)p.payload.size, p.payload.bytes);
                 serialPrint->println();
             } else if ((moduleConfig.serial.mode == meshtastic_ModuleConfig_SerialConfig_Serial_Mode_NMEA ||
                         moduleConfig.serial.mode == meshtastic_ModuleConfig_SerialConfig_Serial_Mode_CALTOPO) &&
@@ -420,9 +415,13 @@ ProcessMessage SerialModuleRadio::handleReceived(const meshtastic_MeshPacket &mp
                         decoded = &scratch;
                     }
                     // send position packet as WPL to the serial port
-                    printWPL(outbuf, sizeof(outbuf), *decoded, nodeDB->getMeshNode(getFrom(&mp))->user.long_name,
-                             moduleConfig.serial.mode == meshtastic_ModuleConfig_SerialConfig_Serial_Mode_CALTOPO);
-                    serialPrint->printf("%s", outbuf);
+                    {
+                        meshtastic_NodeInfoLite *senderNode = nodeDB->getMeshNode(getFrom(&mp));
+                        const char *senderName = senderNode ? senderNode->long_name : "";
+                        printWPL(outbuf, sizeof(outbuf), *decoded, senderName,
+                                 moduleConfig.serial.mode == meshtastic_ModuleConfig_SerialConfig_Serial_Mode_CALTOPO);
+                        serialPrint->printf("%s", outbuf);
+                    }
                 }
             }
         }
@@ -536,9 +535,8 @@ ParsedLine parseLine(const char *line)
  */
 void SerialModule::processWXSerial()
 {
-#if !defined(TTGO_T_ECHO) && !defined(T_ECHO_LITE) && !defined(CANARYONE) && !defined(CONFIG_IDF_TARGET_ESP32C6) &&              \
-    !defined(MESHLINK) && !defined(ELECROW_ThinkNode_M1) && !defined(ELECROW_ThinkNode_M3) && !defined(ELECROW_ThinkNode_M5) &&  \
-    !defined(ARCH_STM32WL) && !defined(MUZI_BASE)
+#if SERIAL_PRINT_PORT != 0 && !defined(ARCH_STM32WL) && !defined(CONFIG_IDF_TARGET_ESP32C6)
+
     static unsigned int lastAveraged = 0;
     static unsigned int averageIntervalMillis = 300000; // 5 minutes hard coded.
     static double dir_sum_sin = 0;
@@ -655,7 +653,7 @@ void SerialModule::processWXSerial()
         LOG_INFO("WS8X : %i %.1fg%.1f %.1fv %.1fv %.1fC rain: %.1f, %i sum", atoi(windDir), strtof(windVel, nullptr),
                  strtof(windGust, nullptr), batVoltageF, capVoltageF, temperatureF, rain, rainSum);
     }
-    if (gotwind && !Throttle::isWithinTimespanMs(lastAveraged, averageIntervalMillis)) {
+    if (gotwind && !Throttle::isWithinTimespanMs(lastAveraged, averageIntervalMillis) && velCount > 0 && dirCount > 0) {
         // calculate averages and send to the mesh
         float velAvg = 1.0 * velSum / velCount;
 

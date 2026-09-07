@@ -2,31 +2,67 @@
 #include "Default.h"
 #include "MeshService.h"
 #include "NodeDB.h"
-#include "RTC.h"
+#include "NodeStatus.h"
 #include "Router.h"
+#include "TransmitHistory.h"
+#include "UptimeClock.h"
 #include "configuration.h"
+#include "gps/RTC.h"
 #include "main.h"
 #include <Throttle.h>
+#include <algorithm>
+
+#ifndef USERPREFS_NODEINFO_REPLY_SUPPRESS_SECS
+#define USERPREFS_NODEINFO_REPLY_SUPPRESS_SECS (12 * 60 * 60)
+#endif
 
 NodeInfoModule *nodeInfoModule;
 
+static constexpr uint32_t NodeInfoReplySuppressSeconds = USERPREFS_NODEINFO_REPLY_SUPPRESS_SECS;
+
 bool NodeInfoModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, meshtastic_User *pptr)
 {
+    suppressReplyForCurrentRequest = false;
+
     if (mp.from == nodeDB->getNodeNum()) {
-        LOG_WARN("Ignoring packet supposed to be from our own node: %08x", mp.from);
+        LOG_WARN("Ignoring packet supposed to be from our own node: 0x%08x", mp.from);
         return false;
     }
 
     auto p = *pptr;
+
+    // Suppress replies to senders we've replied to recently (12H window)
+    if (mp.decoded.want_response && !isFromUs(&mp)) {
+        const NodeNum sender = getFrom(&mp);
+        // A local dedup window, not a wall-clock reading - uptime avoids RTC jumps and replayed
+        // packets' stale rx_time perturbing it. Seconds, not millis - this is a wide window.
+        const uint32_t nowSecs = Time::getUptimeSecs();
+        auto it = lastNodeInfoSeen.find(sender);
+        if (it != lastNodeInfoSeen.end() && (uint32_t)(nowSecs - it->second) < NodeInfoReplySuppressSeconds) {
+            suppressReplyForCurrentRequest = true;
+        }
+        lastNodeInfoSeen[sender] = nowSecs;
+        pruneLastNodeInfoCache();
+    }
+
     if (p.is_licensed != owner.is_licensed) {
-        LOG_WARN("Invalid nodeInfo detected, is_licensed mismatch!");
+        LOG_WARN("Invalid nodeInfo detected, is_licensed mismatch");
+        return true;
+    }
+    NodeNum sourceNum = getFrom(&mp);
+    // Broadcasts only: unicast NodeInfo is unsigned off ham, so updateUser refuses the identity
+    // write instead. isKnownXeddsaSigner also covers the warm tier.
+    if (nodeDB->isKnownXeddsaSigner(sourceNum) && !mp.xeddsa_signed && isBroadcast(mp.to)) {
+        LOG_WARN("Dropping unsigned NodeInfo broadcast from node 0x%08x that previously signed", sourceNum);
         return true;
     }
 
     // Coerce user.id to be derived from the node number
     snprintf(p.id, sizeof(p.id), "!%08x", getFrom(&mp));
 
-    bool hasChanged = nodeDB->updateUser(getFrom(&mp), p, mp.channel);
+    // updateUser() refuses the identity write for a known signer sending unsigned (all unicast
+    // NodeInfo), so the exchange above still proceeds but cannot spoof the stored name.
+    bool hasChanged = nodeDB->updateUser(getFrom(&mp), p, mp.channel, mp.xeddsa_signed);
 
     bool wasBroadcast = isBroadcast(mp.to);
 
@@ -34,13 +70,16 @@ bool NodeInfoModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp, mes
     // if user has changed while packet was not for us, inform phone
     if (hasChanged && !wasBroadcast && !isToUs(&mp)) {
         auto packetCopy = packetPool.allocCopy(mp); // Keep a copy of the packet for later analysis
+        if (packetCopy) {
+            // Re-encode the user protobuf, as we have stripped out the user.id
+            packetCopy->decoded.payload.size = pb_encode_to_bytes(
+                packetCopy->decoded.payload.bytes, sizeof(packetCopy->decoded.payload.bytes), &meshtastic_User_msg, &p);
 
-        // Re-encode the user protobuf, as we have stripped out the user.id
-        packetCopy->decoded.payload.size = pb_encode_to_bytes(
-            packetCopy->decoded.payload.bytes, sizeof(packetCopy->decoded.payload.bytes), &meshtastic_User_msg, &p);
-
-        service->sendToPhone(packetCopy);
+            service->sendToPhone(packetCopy);
+        }
     }
+
+    pruneLastNodeInfoCache();
 
     // LOG_DEBUG("did handleReceived");
     return false; // Let others look at this message also if they want
@@ -56,7 +95,7 @@ void NodeInfoModule::alterReceivedProtobuf(meshtastic_MeshPacket &mp, meshtastic
         pb_encode_to_bytes(mp.decoded.payload.bytes, sizeof(mp.decoded.payload.bytes), &meshtastic_User_msg, p);
 }
 
-void NodeInfoModule::sendOurNodeInfo(NodeNum dest, bool wantReplies, uint8_t channel, bool _shorterTimeout)
+bool NodeInfoModule::sendOurNodeInfo(NodeNum dest, bool wantReplies, uint8_t channel, bool _shorterTimeout)
 {
     // cancel any not yet sent (now stale) position packets
     if (prevPacketId) // if we wrap around to zero, we'll simply fail to cancel in that rare case (no big deal)
@@ -68,9 +107,11 @@ void NodeInfoModule::sendOurNodeInfo(NodeNum dest, bool wantReplies, uint8_t cha
 
     if (p) { // Check whether we didn't ignore it
         p->to = dest;
-        p->decoded.want_response = (config.device.role != meshtastic_Config_DeviceConfig_Role_TRACKER &&
+        bool requestWantResponse = (config.device.role != meshtastic_Config_DeviceConfig_Role_TRACKER &&
                                     config.device.role != meshtastic_Config_DeviceConfig_Role_SENSOR) &&
                                    wantReplies;
+
+        p->decoded.want_response = requestWantResponse;
         if (_shorterTimeout)
             p->priority = meshtastic_MeshPacket_Priority_DEFAULT;
         else
@@ -84,34 +125,53 @@ void NodeInfoModule::sendOurNodeInfo(NodeNum dest, bool wantReplies, uint8_t cha
 
         service->sendToMesh(p);
         shorterTimeout = false;
+        return true;
     }
+    return false;
+}
+
+void NodeInfoModule::triggerImmediateNodeInfoCheck()
+{
+    LOG_DEBUG("NodeInfo: scheduling immediate periodic check");
+    setIntervalFromNow(0);
 }
 
 meshtastic_MeshPacket *NodeInfoModule::allocReply()
 {
+    // Only apply suppression when actually replying to someone else's request, not for periodic broadcasts.
+    const bool isReplyingToExternalRequest = currentRequest &&
+                                             currentRequest->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
+                                             currentRequest->decoded.portnum == meshtastic_PortNum_NODEINFO_APP &&
+                                             currentRequest->decoded.want_response && !isFromUs(currentRequest);
+
+    if (suppressReplyForCurrentRequest && isReplyingToExternalRequest) {
+        LOG_DEBUG("Skip send NodeInfo since we heard the requester <12h ago");
+        ignoreRequest = true;
+        suppressReplyForCurrentRequest = false;
+        return NULL;
+    }
+
     if (!airTime->isTxAllowedChannelUtil(false)) {
         ignoreRequest = true; // Mark it as ignored for MeshModule
         LOG_DEBUG("Skip send NodeInfo > 40%% ch. util");
         return NULL;
     }
-    // If we sent our NodeInfo less than 5 min. ago, don't send it again as it may be still underway.
-    if (!shorterTimeout && lastSentToMesh && Throttle::isWithinTimespanMs(lastSentToMesh, 5 * 60 * 1000)) {
-        LOG_DEBUG("Skip send NodeInfo since we sent it <5min ago");
+
+    // Use graduated scaling based on active mesh size (10 minute base, scales with congestion coefficient)
+    uint32_t timeoutMs = Default::getConfiguredOrDefaultMsScaled(0, 10 * 60, nodeStatus->getNumOnline());
+    uint32_t lastNodeInfo = transmitHistory ? transmitHistory->getLastSentToMeshMillis(meshtastic_PortNum_NODEINFO_APP) : 0;
+    if (!shorterTimeout && lastNodeInfo && Throttle::isWithinTimespanMs(lastNodeInfo, timeoutMs)) {
+        LOG_DEBUG("Skip send NodeInfo since we sent it <%us ago", timeoutMs / 1000);
         ignoreRequest = true; // Mark it as ignored for MeshModule
         return NULL;
-    } else if (shorterTimeout && lastSentToMesh && Throttle::isWithinTimespanMs(lastSentToMesh, 60 * 1000)) {
+    } else if (shorterTimeout && lastNodeInfo && Throttle::isWithinTimespanMs(lastNodeInfo, 60 * 1000)) {
+        // For interactive/urgent requests (e.g., user-triggered or implicit requests), use a shorter 60s timeout
         LOG_DEBUG("Skip send NodeInfo since we sent it <60s ago");
-        ignoreRequest = true; // Mark it as ignored for MeshModule
+        ignoreRequest = true;
         return NULL;
     } else {
         ignoreRequest = false; // Don't ignore requests anymore
-        meshtastic_User &u = owner;
-
-        // Strip the public key if the user is licensed
-        if (u.is_licensed && u.public_key.size > 0) {
-            u.public_key.bytes[0] = 0;
-            u.public_key.size = 0;
-        }
+        meshtastic_User u = owner;
 
         // FIXME: Clear the user.id field since it should be derived from node number on the receiving end
         // u.id[0] = '\0';
@@ -120,8 +180,39 @@ meshtastic_MeshPacket *NodeInfoModule::allocReply()
         strcpy(u.id, nodeDB->getNodeId().c_str());
 
         LOG_INFO("Send owner %s/%s/%s", u.id, u.long_name, u.short_name);
-        lastSentToMesh = millis();
+        if (transmitHistory)
+            transmitHistory->setLastSentToMesh(meshtastic_PortNum_NODEINFO_APP);
         return allocDataProtobuf(u);
+    }
+}
+
+void NodeInfoModule::pruneLastNodeInfoCache()
+{
+    if (!nodeDB || !nodeDB->meshNodes)
+        return;
+
+    const size_t maxEntries = nodeDB->meshNodes->size();
+    const uint32_t nowSecs = Time::getUptimeSecs();
+
+    // Drop entries for nodes we no longer know, and any stamp already past the suppression window:
+    // it can only decide "don't suppress", so keeping it buys nothing.
+    for (auto it = lastNodeInfoSeen.begin(); it != lastNodeInfoSeen.end();) {
+        if (!nodeDB->getMeshNode(it->first) || (uint32_t)(nowSecs - it->second) >= NodeInfoReplySuppressSeconds) {
+            it = lastNodeInfoSeen.erase(it);
+        } else {
+            ++it;
+        }
+    }
+
+    // Evict by largest elapsed time rather than smallest stamp, so the victim is still the oldest
+    // entry if the uptime counter ever wraps underneath us.
+    while (!lastNodeInfoSeen.empty() && lastNodeInfoSeen.size() > maxEntries) {
+        auto oldestIt = std::max_element(
+            lastNodeInfoSeen.begin(), lastNodeInfoSeen.end(),
+            [nowSecs](const std::pair<const NodeNum, uint32_t> &lhs, const std::pair<const NodeNum, uint32_t> &rhs) {
+                return (uint32_t)(nowSecs - lhs.second) < (uint32_t)(nowSecs - rhs.second);
+            });
+        lastNodeInfoSeen.erase(oldestIt);
     }
 }
 
@@ -136,13 +227,12 @@ NodeInfoModule::NodeInfoModule()
 
 int32_t NodeInfoModule::runOnce()
 {
-    // If we changed channels, ask everyone else for their latest info
-    bool requestReplies = currentGeneration != radioGeneration;
-    currentGeneration = radioGeneration;
-
     if (airTime->isTxAllowedAirUtil() && config.device.role != meshtastic_Config_DeviceConfig_Role_CLIENT_HIDDEN) {
+        // If we changed channels, ask everyone else for their latest info
+        bool requestReplies = currentGeneration != radioGeneration;
         LOG_INFO("Send our nodeinfo to mesh (wantReplies=%d)", requestReplies);
-        sendOurNodeInfo(NODENUM_BROADCAST, requestReplies); // Send our info (don't request replies)
+        if (sendOurNodeInfo(NODENUM_BROADCAST, requestReplies))
+            currentGeneration = radioGeneration; // only a send that went out consumes the channel change
     }
     return Default::getConfiguredOrDefaultMs(config.device.node_info_broadcast_secs, default_node_info_broadcast_secs);
 }

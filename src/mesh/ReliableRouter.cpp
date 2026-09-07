@@ -1,6 +1,7 @@
 #include "ReliableRouter.h"
 #include "Default.h"
 #include "MeshTypes.h"
+#include "NodeDB.h"
 #include "configuration.h"
 #include "memGet.h"
 #include "mesh-pb-constants.h"
@@ -15,18 +16,24 @@
  */
 ErrorCode ReliableRouter::send(meshtastic_MeshPacket *p)
 {
+    if (isBlockedEventCoordinatePacket(p)) {
+        LOG_DEBUG("Suppress reliable coordinate send on event (everyone) channel");
+        packetPool.release(p);
+        return meshtastic_Routing_Error_NOT_AUTHORIZED;
+    }
+
+    const GlobalPacketId key(p);
+    const bool retransmitting = p->want_ack;
+
     if (p->want_ack) {
-        // If someone asks for acks on broadcast, we need the hop limit to be at least one, so that first node that receives our
-        // message will rebroadcast.  But asking for hop_limit 0 in that context means the client app has no preference on hop
-        // counts and we want this message to get through the whole mesh, so use the default.
-        if (p->hop_limit == 0) {
-            p->hop_limit = Default::getConfiguredOrDefaultHopLimit(config.lora.hop_limit);
-        }
         DEBUG_HEAP_BEFORE;
         auto copy = packetPool.allocCopy(*p);
         DEBUG_HEAP_AFTER("ReliableRouter::send", copy);
 
-        startRetransmission(copy, NUM_RELIABLE_RETX);
+        if (copy) {
+            const uint8_t totalAttempts = isBroadcast(p->to) ? NUM_RELIABLE_RETX : NUM_RELIABLE_UNICAST_ATTEMPTS;
+            startRetransmission(copy, totalAttempts);
+        }
     }
 
     /* If we have pending retransmissions, add the airtime of this packet to it, because during that time we cannot receive an
@@ -38,37 +45,51 @@ ErrorCode ReliableRouter::send(meshtastic_MeshPacket *p)
         }
     }
 
-    return isBroadcast(p->to) ? FloodingRouter::send(p) : NextHopRouter::send(p);
+    ErrorCode result = isBroadcast(p->to) ? FloodingRouter::send(p) : NextHopRouter::send(p);
+    // Duty-cycle rejections may clear before the scheduled retry.
+    if (retransmitting && result != ERRNO_OK && result != meshtastic_Routing_Error_DUTY_CYCLE_LIMIT)
+        stopRetransmission(key);
+
+    return result;
+}
+
+void ReliableRouter::perhapsGenerateImplicitAckForOwnOverheard(const meshtastic_MeshPacket *p)
+{
+    // Note: do not use getFrom() here, because we want to ignore messages sent from phone
+    if (p->from != getNodeNum())
+        return;
+
+    printPacket("Rx someone rebroadcasting for us", p);
+
+    // We are seeing someone rebroadcast one of our transmissions. If this is the first time we saw
+    // this, cancel any retransmissions we have queued up and generate an internal ack for the
+    // original sending process. Header-only (from/id), so it works even for a packet we cannot
+    // decrypt - notably a PKI DM we originated, which is opaque to us when overheard.
+
+    // This "optimization", does save lots of airtime. For DMs, you also get a real ACK back
+    // from the intended recipient.
+    auto key = GlobalPacketId(getFrom(p), p->id);
+    auto old = findPendingPacket(key);
+    if (old) {
+        LOG_DEBUG("Generate implicit ack");
+        // NOTE: we do NOT check p->wantAck here because p is the INCOMING rebroadcast and that packet is not expected to be
+        // marked as wantAck
+        // Pass the overheard rebroadcast as the relay source so the ack carries the relaying node's id
+        // and the RSSI/SNR we heard it at.
+        sendAckNak(meshtastic_Routing_Error_NONE, getFrom(p), p->id, old->packet->channel, 0, false, p);
+
+        // Only stop retransmissions if the rebroadcast came via LoRa
+        if (p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA) {
+            stopRetransmission(key);
+        }
+    } else {
+        LOG_DEBUG("Didn't find pending packet");
+    }
 }
 
 bool ReliableRouter::shouldFilterReceived(const meshtastic_MeshPacket *p)
 {
-    // Note: do not use getFrom() here, because we want to ignore messages sent from phone
-    if (p->from == getNodeNum()) {
-        printPacket("Rx someone rebroadcasting for us", p);
-
-        // We are seeing someone rebroadcast one of our broadcast attempts.
-        // If this is the first time we saw this, cancel any retransmissions we have queued up and generate an internal ack for
-        // the original sending process.
-
-        // This "optimization", does save lots of airtime. For DMs, you also get a real ACK back
-        // from the intended recipient.
-        auto key = GlobalPacketId(getFrom(p), p->id);
-        auto old = findPendingPacket(key);
-        if (old) {
-            LOG_DEBUG("Generate implicit ack");
-            // NOTE: we do NOT check p->wantAck here because p is the INCOMING rebroadcast and that packet is not expected to be
-            // marked as wantAck
-            sendAckNak(meshtastic_Routing_Error_NONE, getFrom(p), p->id, old->packet->channel);
-
-            // Only stop retransmissions if the rebroadcast came via LoRa
-            if (p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_LORA) {
-                stopRetransmission(key);
-            }
-        } else {
-            LOG_DEBUG("Didn't find pending packet");
-        }
-    }
+    perhapsGenerateImplicitAckForOwnOverheard(p);
 
     /* At this point we have already deleted the pending retransmission if this packet was an (implicit) ACK to it.
        Now for all other pending retransmissions, we have to add the airtime of this received packet to the retransmission timer,
@@ -108,26 +129,26 @@ void ReliableRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtas
                         // If this packet should always be ACKed reliably with want_ack back to the original sender, make sure we
                         // do that unconditionally.
                         sendAckNak(meshtastic_Routing_Error_NONE, getFrom(p), p->id, p->channel,
-                                   routingModule->getHopLimitForResponse(p->hop_start, p->hop_limit), true);
+                                   routingModule->getHopLimitForResponse(*p), true);
                     } else if (!p->decoded.request_id && !p->decoded.reply_id) {
                         // If it's not an ACK or a reply, send an ACK.
                         sendAckNak(meshtastic_Routing_Error_NONE, getFrom(p), p->id, p->channel,
-                                   routingModule->getHopLimitForResponse(p->hop_start, p->hop_limit));
-                    } else if ((p->hop_start > 0 && p->hop_start == p->hop_limit) || p->next_hop != NO_NEXT_HOP_PREFERENCE) {
+                                   routingModule->getHopLimitForResponse(*p));
+                    } else if ((getHopsAway(*p) == 0) || p->next_hop != NO_NEXT_HOP_PREFERENCE) {
                         // If we received the packet directly from the original sender, send a 0-hop ACK since the original sender
                         // won't overhear any implicit ACKs. If we received the packet via NextHopRouter, also send a 0-hop ACK to
                         // stop the immediate relayer's retransmissions.
                         sendAckNak(meshtastic_Routing_Error_NONE, getFrom(p), p->id, p->channel, 0);
                     }
                 } else if (p->which_payload_variant == meshtastic_MeshPacket_encrypted_tag && p->channel == 0 &&
-                           (nodeDB->getMeshNode(p->from) == nullptr || nodeDB->getMeshNode(p->from)->user.public_key.size == 0)) {
+                           (nodeDB->getMeshNode(p->from) == nullptr || nodeDB->getMeshNode(p->from)->public_key.size == 0)) {
                     LOG_INFO("PKI packet from unknown node, send PKI_UNKNOWN_PUBKEY");
                     sendAckNak(meshtastic_Routing_Error_PKI_UNKNOWN_PUBKEY, getFrom(p), p->id, channels.getPrimaryIndex(),
-                               routingModule->getHopLimitForResponse(p->hop_start, p->hop_limit));
+                               routingModule->getHopLimitForResponse(*p));
                 } else {
                     // Send a 'NO_CHANNEL' error on the primary channel if want_ack packet destined for us cannot be decoded
                     sendAckNak(meshtastic_Routing_Error_NO_CHANNEL, getFrom(p), p->id, channels.getPrimaryIndex(),
-                               routingModule->getHopLimitForResponse(p->hop_start, p->hop_limit));
+                               routingModule->getHopLimitForResponse(*p));
                 }
             } else if (p->next_hop == nodeDB->getLastByteOfNodeNum(getNodeNum()) && p->hop_limit > 0) {
                 // No wantAck, but we need to ACK with hop limit of 0 if we were the next hop to stop their retransmissions
@@ -153,9 +174,13 @@ void ReliableRouter::sniffReceived(const meshtastic_MeshPacket *p, const meshtas
         if ((ackId || nakId) &&
             // Implicit ACKs from MQTT should not stop retransmissions
             !(isFromUs(p) && p->transport_mechanism == meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MQTT)) {
-            LOG_DEBUG("Received a %s for 0x%x, stopping retransmissions", ackId ? "ACK" : "NAK", ackId);
+            LOG_DEBUG("Received a %s for 0x%08x, stopping retransmissions", ackId ? "ACK" : "NAK", ackId);
             if (ackId) {
                 stopRetransmission(p->to, ackId);
+                // M3: an end-to-end ACK proves the directed route to the ACK's sender currently works,
+                // so clear its failure count and refresh freshness (keeps a good route pinned).
+                if (!isBroadcast(getFrom(p)))
+                    noteRouteSuccess(getFrom(p), millis());
             } else {
                 stopRetransmission(p->to, nakId);
             }

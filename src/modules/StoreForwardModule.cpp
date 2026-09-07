@@ -15,11 +15,11 @@
 #include "StoreForwardModule.h"
 #include "MeshService.h"
 #include "NodeDB.h"
-#include "RTC.h"
 #include "Router.h"
 #include "Throttle.h"
 #include "airtime.h"
 #include "configuration.h"
+#include "gps/RTC.h"
 #include "memGet.h"
 #include "mesh-pb-constants.h"
 #include "mesh/generated/meshtastic/storeforward.pb.h"
@@ -80,9 +80,9 @@ void StoreForwardModule::populatePSRAM()
         (this->records ? this->records : (((memGet.getFreePsram() / 4) * 3) / sizeof(PacketHistoryStruct)));
     this->records = numberOfPackets;
 #if defined(ARCH_ESP32)
-    this->packetHistory = static_cast<PacketHistoryStruct *>(ps_calloc(numberOfPackets, sizeof(PacketHistoryStruct)));
+    this->packetHistory.reset(static_cast<PacketHistoryStruct *>(ps_calloc(numberOfPackets, sizeof(PacketHistoryStruct))));
 #elif defined(ARCH_PORTDUINO)
-    this->packetHistory = static_cast<PacketHistoryStruct *>(calloc(numberOfPackets, sizeof(PacketHistoryStruct)));
+    this->packetHistory.reset(static_cast<PacketHistoryStruct *>(calloc(numberOfPackets, sizeof(PacketHistoryStruct))));
 
 #endif
 
@@ -131,9 +131,7 @@ void StoreForwardModule::historySend(uint32_t secAgo, uint32_t to)
 uint32_t StoreForwardModule::getNumAvailablePackets(NodeNum dest, uint32_t last_time)
 {
     uint32_t count = 0;
-    if (lastRequest.find(dest) == lastRequest.end()) {
-        lastRequest.emplace(dest, 0);
-    }
+    lastRequest.emplace(dest, 0);
     for (uint32_t i = lastRequest[dest]; i < this->packetHistoryTotalCount; i++) {
         if (this->packetHistory[i].time && (this->packetHistory[i].time > last_time)) {
             // Client is only interested in packets not from itself and only in broadcast packets or packets towards it.
@@ -195,6 +193,9 @@ void StoreForwardModule::historyAdd(const meshtastic_MeshPacket &mp)
     }
 
     this->packetHistory[this->packetHistoryTotalCount].time = getTime();
+    // getTime() silently falls back to a boot-relative count with no RTC source at all; record
+    // whether it was actually trustworthy so replay doesn't have to guess from current quality.
+    this->packetHistory[this->packetHistoryTotalCount].has_rx_time = (getRTCQuality() >= RTCQualityFromNet);
     this->packetHistory[this->packetHistoryTotalCount].to = mp.to;
     this->packetHistory[this->packetHistoryTotalCount].channel = mp.channel;
     this->packetHistory[this->packetHistoryTotalCount].from = getFrom(&mp);
@@ -203,12 +204,13 @@ void StoreForwardModule::historyAdd(const meshtastic_MeshPacket &mp)
     this->packetHistory[this->packetHistoryTotalCount].emoji = (bool)p.emoji;
     this->packetHistory[this->packetHistoryTotalCount].payload_size = p.payload.size;
     this->packetHistory[this->packetHistoryTotalCount].rx_rssi = mp.rx_rssi;
+    this->packetHistory[this->packetHistoryTotalCount].has_rx_rssi = mp.has_rx_rssi;
     this->packetHistory[this->packetHistoryTotalCount].rx_snr = mp.rx_snr;
     this->packetHistory[this->packetHistoryTotalCount].hop_start = mp.hop_start;
     this->packetHistory[this->packetHistoryTotalCount].hop_limit = mp.hop_limit;
     this->packetHistory[this->packetHistoryTotalCount].via_mqtt = mp.via_mqtt;
     this->packetHistory[this->packetHistoryTotalCount].transport_mechanism = mp.transport_mechanism;
-    memcpy(this->packetHistory[this->packetHistoryTotalCount].payload, p.payload.bytes, meshtastic_Constants_DATA_PAYLOAD_LEN);
+    memcpy(this->packetHistory[this->packetHistoryTotalCount].payload, p.payload.bytes, p.payload.size);
 
     this->packetHistoryTotalCount++;
 }
@@ -250,6 +252,8 @@ meshtastic_MeshPacket *StoreForwardModule::preparePayload(NodeNum dest, uint32_t
                 (this->packetHistory[i].to == NODENUM_BROADCAST || this->packetHistory[i].to == dest)) {
 
                 meshtastic_MeshPacket *p = allocDataPacket();
+                if (!p)
+                    return nullptr;
 
                 p->to = local ? this->packetHistory[i].to : dest; // PhoneAPI can handle original `to`
                 p->from = this->packetHistory[i].from;
@@ -257,8 +261,10 @@ meshtastic_MeshPacket *StoreForwardModule::preparePayload(NodeNum dest, uint32_t
                 p->channel = this->packetHistory[i].channel;
                 p->decoded.reply_id = this->packetHistory[i].reply_id;
                 p->rx_time = this->packetHistory[i].time;
+                p->has_rx_time = this->packetHistory[i].has_rx_time; // presence captured at store time, not replay time
                 p->decoded.emoji = (uint32_t)this->packetHistory[i].emoji;
                 p->rx_rssi = this->packetHistory[i].rx_rssi;
+                p->has_rx_rssi = this->packetHistory[i].has_rx_rssi; // presence captured at store time, not replay time
                 p->rx_snr = this->packetHistory[i].rx_snr;
                 p->hop_start = this->packetHistory[i].hop_start;
                 p->hop_limit = this->packetHistory[i].hop_limit;
@@ -306,6 +312,8 @@ meshtastic_MeshPacket *StoreForwardModule::preparePayload(NodeNum dest, uint32_t
 void StoreForwardModule::sendMessage(NodeNum dest, const meshtastic_StoreAndForward &payload)
 {
     meshtastic_MeshPacket *p = allocDataProtobuf(payload);
+    if (!p)
+        return;
 
     p->to = dest;
 
@@ -342,6 +350,8 @@ void StoreForwardModule::sendMessage(NodeNum dest, meshtastic_StoreAndForward_Re
 void StoreForwardModule::sendErrorTextMessage(NodeNum dest, bool want_response)
 {
     meshtastic_MeshPacket *pr = allocDataPacket();
+    if (!pr)
+        return;
     pr->to = dest;
     pr->priority = meshtastic_MeshPacket_Priority_BACKGROUND;
     pr->want_ack = false;
@@ -411,7 +421,7 @@ ProcessMessage StoreForwardModule::handleReceived(const meshtastic_MeshPacket &m
                 }
             } else {
                 storeForwardModule->historyAdd(mp);
-                LOG_INFO("S&F stored. Message history contains %u records now", this->packetHistoryTotalCount);
+                LOG_INFO("S&F stored, history has %u records", this->packetHistoryTotalCount);
             }
         } else if (!isFromUs(&mp) && mp.decoded.portnum == meshtastic_PortNum_STORE_FORWARD_APP) {
             auto &p = mp.decoded;
@@ -421,7 +431,7 @@ ProcessMessage StoreForwardModule::handleReceived(const meshtastic_MeshPacket &m
                 if (pb_decode_from_bytes(p.payload.bytes, p.payload.size, &meshtastic_StoreAndForward_msg, &scratch)) {
                     decoded = &scratch;
                 } else {
-                    LOG_ERROR("Error decoding proto module!");
+                    LOG_ERROR("Error decoding proto module");
                     // if we can't decode it, nobody can process it!
                     return ProcessMessage::STOP;
                 }
@@ -513,7 +523,7 @@ bool StoreForwardModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp,
             LOG_DEBUG("StoreAndForward_RequestResponse_ROUTER_BUSY");
             // retry in messages_saved * packetTimeMax ms
             retry_delay = millis() + getNumAvailablePackets(this->busyTo, this->last_time) * packetTimeMax *
-                                         (meshtastic_StoreAndForward_RequestResponse_ROUTER_ERROR ? 2 : 1);
+                                         (p->rr == meshtastic_StoreAndForward_RequestResponse_ROUTER_ERROR ? 2 : 1);
         }
         break;
 
@@ -557,8 +567,8 @@ bool StoreForwardModule::handleReceivedProtobuf(const meshtastic_MeshPacket &mp,
             // These fields only have informational purpose on a client. Fill them to consume later.
             if (p->which_variant == meshtastic_StoreAndForward_history_tag) {
                 this->historyReturnWindow = p->variant.history.window / 60000;
-                LOG_INFO("Router Response HISTORY - Sending %d messages from last %d minutes",
-                         p->variant.history.history_messages, this->historyReturnWindow);
+                LOG_INFO("HISTORY response: %d msgs from last %d min", p->variant.history.history_messages,
+                         this->historyReturnWindow);
             }
         }
         break;
@@ -590,7 +600,8 @@ StoreForwardModule::StoreForwardModule()
     if (moduleConfig.store_forward.enabled) {
 
         // Router
-        if ((config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER || moduleConfig.store_forward.is_server)) {
+        if ((config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER ||
+             config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE || moduleConfig.store_forward.is_server)) {
             LOG_INFO("Init Store & Forward Module in Server mode");
             if (memGet.getPsramSize() > 0) {
                 if (memGet.getFreePsram() >= 1024 * 1024) {
