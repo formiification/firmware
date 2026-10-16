@@ -1523,6 +1523,14 @@ void Router::dispatchReceived(meshtastic_MeshPacket *p, RxSource src)
         }
 #endif
 
+// Drop broadcast packets with want_response flag to prevent ddos attacks on network -- format 2026.10.11
+if (isBroadcast(p->to) && p->decoded.want_response){
+    LOG_ERROR("Broadcast with want_response, ignore packet");
+    cancelSending(p->from, p->id);
+    skipHandle = true;
+}
+
+
         // Neighbor info module is disabled, ignore expensive neighbor info packets
         if (p->which_payload_variant == meshtastic_MeshPacket_decoded_tag &&
             p->decoded.portnum == meshtastic_PortNum_NEIGHBORINFO_APP &&
