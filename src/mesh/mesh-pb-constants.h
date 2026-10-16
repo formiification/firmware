@@ -108,7 +108,7 @@ static inline int get_max_num_nodes()
 {
     uint32_t flash_size = ESP.getFlashChipSize() / (1024 * 1024); // Convert Bytes to MB
     if (flash_size >= 15) {
-        return 250;
+        return 500;
     } else if (flash_size >= 7) {
         return 200;
     } else {
@@ -121,7 +121,7 @@ static inline int get_max_num_nodes()
 // Reaching here means that stopped working - still refuse to invent a divergent compile-time cap.
 #error "ARCH_PORTDUINO: configuration.h did not define MAX_NUM_NODES - check variants/native/portduino/variant.h"
 #else
-#define MAX_NUM_NODES 120 // nRF52840 and generic ESP32 (inc. ESP32C3 etc.)
+#define MAX_NUM_NODES 160 // nRF52840 and generic ESP32 (inc. ESP32C3 etc.)
 #endif                    // platform
 #endif                    // MAX_NUM_NODES
 

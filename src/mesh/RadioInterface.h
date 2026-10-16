@@ -16,7 +16,7 @@
 // Forward decl to avoid a direct include of generated config headers / full LoRaConfig definition in this widely-included file.
 typedef struct _meshtastic_Config_LoRaConfig meshtastic_Config_LoRaConfig;
 
-#define MAX_TX_QUEUE 16 // max number of packets which can be waiting for transmission
+#define MAX_TX_QUEUE 32 // max number of packets which can be waiting for transmission
 
 #define MAX_LORA_PAYLOAD_LEN 255 // max length of 255 per Semtech's datasheets on SX12xx
 #define MESHTASTIC_HEADER_LENGTH 16
@@ -298,7 +298,7 @@ class RadioInterface
                                                  meshtastic_Config_LoRaConfig_ModemPreset preset);
 
   protected:
-    int8_t power = 17; // Set by applyModemConfig()
+    int8_t power = 27; // Set by applyModemConfig()
 
     float savedFreq;
     uint32_t savedChannelNum;
