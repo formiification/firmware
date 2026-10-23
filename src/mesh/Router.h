@@ -292,6 +292,8 @@ DecodeState perhapsDecode(meshtastic_MeshPacket *p);
 
 /** Apply receive authentication before routing state mutation; unknown-channel packets may remain opaque relay-only. */
 RoutingAuthVerdict passesRoutingAuthGate(meshtastic_MeshPacket *p);
+/** Portnum of `wire` if decoded, or of the copy passesRoutingAuthGate() just decrypted for it; the cache is not consumed. */
+bool authenticatedPortnum(const meshtastic_MeshPacket &wire, meshtastic_PortNum *port);
 #ifdef PIO_UNIT_TESTING
 uint32_t routingAuthEvaluationCount();
 void resetRoutingAuthEvaluationCount();

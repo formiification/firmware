@@ -214,6 +214,23 @@ static void clearRoutingAuthCache()
     routingAuthCache.valid = false;
 }
 
+bool authenticatedPortnum(const meshtastic_MeshPacket &wire, meshtastic_PortNum *port)
+{
+    if (wire.which_payload_variant == meshtastic_MeshPacket_decoded_tag) {
+        *port = wire.decoded.portnum;
+        return true;
+    }
+    if (!routingAuthCacheLock)
+        return false;
+    concurrency::LockGuard guard(routingAuthCacheLock);
+    if (!routingAuthCache.valid || routingAuthCache.policy != config.security.packet_signature_policy ||
+        routingAuthCache.authenticated.which_payload_variant != meshtastic_MeshPacket_decoded_tag ||
+        memcmp(&routingAuthCache.wire, &wire, sizeof(wire)) != 0)
+        return false;
+    *port = routingAuthCache.authenticated.decoded.portnum;
+    return true;
+}
+
 #ifdef PIO_UNIT_TESTING
 uint32_t routingAuthEvaluationCount()
 {

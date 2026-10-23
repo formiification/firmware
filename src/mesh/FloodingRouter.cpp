@@ -124,10 +124,9 @@ bool FloodingRouter::roleAllowsCancelingDupe(const meshtastic_MeshPacket *p)
     }
 
     if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE) {
-        // CLIENT_BASE: if the packet is from or to a favorited node,
-        // we should act like a ROUTER and should never cancel a rebroadcast (i.e. we should always rebroadcast),
+        // CLIENT_BASE: never cancel a rebroadcast of a packet it relays late,
         // even if we've heard another station rebroadcast it already.
-        return !nodeDB->isFromOrToFavoritedNode(*p);
+        return !clientBaseRelaysLate(p);
     }
 
     // All other roles (such as CLIENT) should cancel a rebroadcast if they hear another station's rebroadcast.
@@ -145,10 +144,18 @@ void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
     if (config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE && iface) {
         iface->clampToLateRebroadcastWindow(getFrom(p), p->id);
     }
-    if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE && iface && nodeDB &&
-        nodeDB->isFromOrToFavoritedNode(*p)) {
+    if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE && iface && nodeDB && clientBaseRelaysLate(p)) {
         iface->clampToLateRebroadcastWindow(getFrom(p), p->id);
     }
+}
+
+bool FloodingRouter::clientBaseRelaysLate(const meshtastic_MeshPacket *p)
+{
+    if (nodeDB->isFromOrToFavoritedNode(*p))
+        return true;
+    // The rebroadcast the base overheard may not reach the indoor nodes behind it, so channel text is always carried.
+    meshtastic_PortNum port;
+    return isBroadcast(p->to) && authenticatedPortnum(*p, &port) && port == meshtastic_PortNum_TEXT_MESSAGE_APP;
 }
 
 bool FloodingRouter::isRebroadcaster()
