@@ -457,16 +457,6 @@ bool Channels::isDefaultChannel(ChannelIndex chIndex)
     return false;
 }
 
-bool cryptoKeyIsPublic(const CryptoKey &key)
-{
-    if (key.length == 0)
-        return true; // encryption disabled
-    // Match the defaultpsk family ignoring its last byte (getKey() bumps only that byte per 1-byte index).
-    if (key.length == (int)sizeof(defaultpsk) && memcmp(key.bytes, defaultpsk, sizeof(defaultpsk) - 1) == 0)
-        return true;
-    return false;
-}
-
 bool channelFileUsesPublicKey(const meshtastic_ChannelFile &cf, ChannelIndex chIndex)
 {
     if (chIndex >= cf.channels_count)
@@ -497,13 +487,6 @@ bool channelFileUsesPublicKey(const meshtastic_ChannelFile &cf, ChannelIndex chI
     }
 
     return (psk.size == sizeof(defaultpsk) && memcmp(psk.bytes, defaultpsk, sizeof(defaultpsk) - 1) == 0);
-}
-
-bool Channels::usesPublicKey(ChannelIndex chIndex)
-{
-    // Delegates to the pure, on-disk-struct variant so the two can't drift. getByIndex() reads the same
-    // global channelFile, so this is behavior-preserving for the position-precision clamp callers.
-    return channelFileUsesPublicKey(channelFile, chIndex);
 }
 
 bool Channels::isWellKnownChannel(ChannelIndex chIndex)

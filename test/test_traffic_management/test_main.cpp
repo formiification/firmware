@@ -2552,21 +2552,20 @@ static void test_tm_positionDedup_precisionAbove32_usesDefaultPrecision(void)
 }
 
 /**
- * Verify the dedup fingerprint does not collapse positions that are distinct at the
- * channel's *effective* precision. Dedup only runs on well-known (public) channels,
- * where precision is capped at MAX_POSITION_PRECISION_PUBLIC_KEY (15) regardless of the
- * channel's configured value - so the requested 32 is clamped to 15. Positions must
- * therefore differ in the top 15 bits (>= 2^17 raw units) to read as distinct; here
- * they differ by 2^18, well clear of the precision-15 grid, so neither is dropped.
+ * Verify the dedup fingerprint uses the channel's configured precision as-is, also on a
+ * well-known (public) channel: precision 32 is not coarsened, so two positions one raw unit
+ * apart stay distinct (the fingerprint keeps the 4 lowest significant bits of each coordinate).
+ * Coarsened to 15 bits they would share one grid cell and the second would be dropped as a
+ * duplicate.
  */
-static void test_tm_positionDedup_distinctAtClampedChannelPrecision(void)
+static void test_tm_positionDedup_distinctAtFullChannelPrecision(void)
 {
     moduleConfig.traffic_management.position_min_interval_secs = 300;
-    installWellKnownPrimaryChannelWithPrecision(32); // clamped to 15 on a public channel
+    installWellKnownPrimaryChannelWithPrecision(32);
     TrafficManagementModuleTestShim module;
 
     meshtastic_MeshPacket first = makePositionPacket(kRemoteNode, 374221234, -1220845678);
-    meshtastic_MeshPacket second = makePositionPacket(kRemoteNode, 374221234 + (1 << 18), -1220845678 + (1 << 18));
+    meshtastic_MeshPacket second = makePositionPacket(kRemoteNode, 374221234 + 1, -1220845678 + 1);
 
     ProcessMessage r1 = module.handleReceived(first);
     ProcessMessage r2 = module.handleReceived(second);
@@ -3477,7 +3476,7 @@ TM_TEST_ENTRY void setup()
     RUN_TEST(test_tm_positionDedup_continuousDuplicatesStillRefresh);
     RUN_TEST(test_tm_positionDedup_intervalZero_neverDrops);
     RUN_TEST(test_tm_positionDedup_precisionAbove32_usesDefaultPrecision);
-    RUN_TEST(test_tm_positionDedup_distinctAtClampedChannelPrecision);
+    RUN_TEST(test_tm_positionDedup_distinctAtFullChannelPrecision);
     RUN_TEST(test_tm_positionDedup_precisionZero_channelFallsBackToDefault);
     RUN_TEST(test_tm_positionDedup_cacheFlush_doesNotDropFirstPacketAfterFlush);
     RUN_TEST(test_tm_positionDedup_priorRateState_doesNotDropFirstFingerprintZero);
