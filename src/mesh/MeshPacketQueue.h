@@ -46,4 +46,8 @@ class MeshPacketQueue
 
     /* Attempt to find a packet from this queue. Return true if it was found. */
     bool find(const NodeNum from, const PacketId id);
+
+    /** Move late-window packets whose tx_after has passed back into priority order, so a stream of fresh relays cannot
+     * starve them. Returns how many were moved. */
+    size_t promoteOverdue(uint32_t now);
 };

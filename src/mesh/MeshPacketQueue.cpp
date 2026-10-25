@@ -146,6 +146,26 @@ bool MeshPacketQueue::find(const NodeNum from, const PacketId id)
     return getPacketFromQueue(from, id) != NULL;
 }
 
+size_t MeshPacketQueue::promoteOverdue(uint32_t now)
+{
+    // Late packets sit at the back, behind every packet without tx_after, whatever their priority.
+    std::vector<meshtastic_MeshPacket *> overdue;
+    for (auto it = queue.begin(); it != queue.end();) {
+        if ((*it)->tx_after && Throttle::deadlinePassedAt(now, (*it)->tx_after)) {
+            overdue.push_back(*it);
+            it = queue.erase(it);
+        } else {
+            it++;
+        }
+    }
+    for (auto *p : overdue) {
+        // The late window has been waited out: from here it competes by priority like any other queued packet
+        p->tx_after = 0;
+        queue.insert(std::upper_bound(queue.begin(), queue.end(), p, CompareMeshPacketFunc), p);
+    }
+    return overdue.size();
+}
+
 /**
  * Attempt to find a lower-priority packet in the queue and replace it with the provided one.
  * @return True if the replacement succeeded, false otherwise

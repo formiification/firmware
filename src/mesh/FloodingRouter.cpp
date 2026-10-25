@@ -124,9 +124,9 @@ bool FloodingRouter::roleAllowsCancelingDupe(const meshtastic_MeshPacket *p)
     }
 
     if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE) {
-        // CLIENT_BASE: never cancel a rebroadcast of a packet it relays late,
+        // CLIENT_BASE: never cancel a rebroadcast of a packet it keeps,
         // even if we've heard another station rebroadcast it already.
-        return !clientBaseRelaysLate(p);
+        return !clientBaseKeepsRelay(p);
     }
 
     // All other roles (such as CLIENT) should cancel a rebroadcast if they hear another station's rebroadcast.
@@ -144,12 +144,14 @@ void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
     if (config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE && iface) {
         iface->clampToLateRebroadcastWindow(getFrom(p), p->id);
     }
-    if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE && iface && nodeDB && clientBaseRelaysLate(p)) {
+    // A kept unicast stays in the early window: it follows one path, and the late window would park it behind every other relay
+    if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE && iface && nodeDB && isBroadcast(p->to) &&
+        clientBaseKeepsRelay(p)) {
         iface->clampToLateRebroadcastWindow(getFrom(p), p->id);
     }
 }
 
-bool FloodingRouter::clientBaseRelaysLate(const meshtastic_MeshPacket *p)
+bool FloodingRouter::clientBaseKeepsRelay(const meshtastic_MeshPacket *p)
 {
     if (nodeDB->isFromOrToFavoritedNode(*p))
         return true;

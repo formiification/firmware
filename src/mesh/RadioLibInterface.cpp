@@ -584,6 +584,8 @@ void RadioLibInterface::onNotify(uint32_t notification)
         // If we are not currently in receive mode, then restart the random delay (this can happen if the main thread
         // has placed the unit into standby)  FIXME, how will this work if the chipset is in sleep mode?
         if (!txQueue.empty()) {
+            // Before getFront(): the dequeue below must take the packet the scan was run for
+            txQueue.promoteOverdue(Time::getMillis());
             const bool clear = canSendImmediately();
             // An old bare preamble is noise or LoRa we cannot decode; the CAD below judges the channel instead.
             const bool peek = !clear && sendingPacket == NULL && preambleHoldPeekable();
@@ -651,6 +653,7 @@ void RadioLibInterface::onNotify(uint32_t notification)
 
 void RadioLibInterface::setTransmitDelay()
 {
+    txQueue.promoteOverdue(Time::getMillis());
     meshtastic_MeshPacket *p = txQueue.getFront();
     if (!p) {
         return; // noop if there's nothing in the queue

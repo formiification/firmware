@@ -865,6 +865,11 @@ bool RadioInterface::shouldRebroadcastEarlyLikeRouter(meshtastic_MeshPacket *p)
         return true;
     }
 
+    // CLIENT_BASE: a unicast from or to a favorite follows a single path, so relaying it early adds no flood airtime
+    if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE) {
+        return !isBroadcast(p->to) && nodeDB && nodeDB->isFromOrToFavoritedNode(*p);
+    }
+
     return false;
 }
 

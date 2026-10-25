@@ -70,8 +70,8 @@ class FloodingRouter : public Router
     // the same packet
     bool roleAllowsCancelingDupe(const meshtastic_MeshPacket *p);
 
-    // CLIENT_BASE relays like ROUTER_LATE for packets from/to its favorites and for broadcast TEXT_MESSAGE_APP
-    bool clientBaseRelaysLate(const meshtastic_MeshPacket *p);
+    // CLIENT_BASE never cancels the relay of packets from/to its favorites or of broadcast TEXT_MESSAGE_APP
+    bool clientBaseKeepsRelay(const meshtastic_MeshPacket *p);
 
     /* Call when receiving a duplicate packet to check whether we should cancel a packet in the Tx queue */
     void perhapsCancelDupe(const meshtastic_MeshPacket *p);

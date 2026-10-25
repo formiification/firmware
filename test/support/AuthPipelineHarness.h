@@ -146,6 +146,7 @@ class AuthPipelineRadio : public RadioInterface
         return true;
     }
     uint32_t getPacketTime(uint32_t, bool = false) override { return 7; }
+    void clampToLateRebroadcastWindow(NodeNum, PacketId) override { lateClampCalls++; }
 
     // The TX queue the router asks about. A test loads it to say "this one has not gone out yet";
     // cancelSending() and removePendingTXPacket() take entries back out, as the real queue does.
@@ -187,7 +188,7 @@ class AuthPipelineRadio : public RadioInterface
 
     void reset()
     {
-        sendCalls = cancelCalls = findCalls = removeCalls = 0;
+        sendCalls = cancelCalls = findCalls = removeCalls = lateClampCalls = 0;
         failSend = false;
         sent.clear();
         txQueue.clear();
@@ -198,6 +199,7 @@ class AuthPipelineRadio : public RadioInterface
     uint32_t cancelCalls = 0;
     uint32_t findCalls = 0;
     uint32_t removeCalls = 0;
+    uint32_t lateClampCalls = 0;
 
   private:
     struct TxQueueEntry {
