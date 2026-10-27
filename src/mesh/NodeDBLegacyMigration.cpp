@@ -6,10 +6,17 @@
 //   - true  -> persist via saveNodeDatabaseToDisk()
 //   - false -> reset via installDefaultNodeDatabase()
 //
+// Only our own record (first in a v24 file) and protected nodes (favorite, ignored, key manually
+// verified) migrate; everything else is relearned over the air. Our record carries the fixed
+// position, and dropping the rest at decode time keeps a full 160-node store from OOM-asserting
+// nRF52 into a boot loop.
+//
 // This file (and the deviceonly_legacy proto) can be removed once
 // DEVICESTATE_MIN_VER advances past 24.
 
+#include "FSCommon.h"
 #include "NodeDB.h"
+#include "SPILock.h"
 #include "concurrency/LockGuard.h"
 #include "configuration.h"
 #include "mesh-pb-constants.h"
@@ -20,6 +27,16 @@
 #include <cstring>
 #include <pb_decode.h>
 #include <pb_encode.h>
+
+namespace
+{
+size_t s_legacyDecodedCount = 0; // entries seen by the current migration, kept or not
+
+bool legacyNodeIsProtected(const meshtastic_NodeInfoLite_Legacy &n)
+{
+    return n.is_favorite || n.is_ignored || (n.bitfield & NODEINFO_BITFIELD_IS_KEY_MANUALLY_VERIFIED_MASK);
+}
+} // namespace
 
 bool meshtastic_NodeDatabase_Legacy_callback(pb_istream_t *istream, pb_ostream_t *ostream, const pb_field_t *field)
 {
@@ -36,8 +53,12 @@ bool meshtastic_NodeDatabase_Legacy_callback(pb_istream_t *istream, pb_ostream_t
     if (istream) {
         meshtastic_NodeInfoLite_Legacy node;
         auto *vec = static_cast<std::vector<meshtastic_NodeInfoLite_Legacy> *>(iter->pData);
-        if (istream->bytes_left && pb_decode(istream, meshtastic_NodeInfoLite_Legacy_fields, &node))
-            vec->push_back(node);
+        if (istream->bytes_left && pb_decode(istream, meshtastic_NodeInfoLite_Legacy_fields, &node)) {
+            s_legacyDecodedCount++;
+            // Filter here, not after the decode: holding every fat record first is what ran out of heap.
+            if ((vec->empty() || legacyNodeIsProtected(node)) && vec->size() < (size_t)MAX_NUM_NODES)
+                vec->push_back(node);
+        }
     }
     return true;
 }
@@ -45,6 +66,8 @@ bool meshtastic_NodeDatabase_Legacy_callback(pb_istream_t *istream, pb_ostream_t
 bool NodeDB::migrateLegacyNodeDatabase()
 {
     LOG_WARN("NodeDatabase v%u: migrating to v%u", nodeDatabase.version, DEVICESTATE_CUR_VER);
+    writeLegacyMigrationMarker();
+    s_legacyDecodedCount = 0;
 
     // _init_zero brace-inits the embedded std::vector via its explicit
     // (size_type, allocator) ctor, so default-construct instead.
@@ -128,7 +151,52 @@ bool NodeDB::migrateLegacyNodeDatabase()
     nodeDatabase.version = DEVICESTATE_CUR_VER;
     meshNodes = &nodeDatabase.nodes;
     numMeshNodes = nodeDatabase.nodes.size();
-    LOG_INFO("Migrated %u nodes from legacy -> v%u (positions: %u, telemetry: %u)", (unsigned)numMeshNodes, DEVICESTATE_CUR_VER,
-             (unsigned)posCount, (unsigned)telCount);
+    LOG_INFO("Migrated %u of %u nodes from legacy -> v%u, self and protected only (positions: %u, telemetry: %u)",
+             (unsigned)numMeshNodes, (unsigned)s_legacyDecodedCount, DEVICESTATE_CUR_VER, (unsigned)posCount, (unsigned)telCount);
     return true;
+}
+
+bool NodeDB::legacyMigrationMarkerPresent()
+{
+#ifdef FSCom
+    concurrency::LockGuard g(spiLock);
+    return FSCom.exists(legacyMigrationMarkerFileName);
+#else
+    return false;
+#endif
+}
+
+void NodeDB::writeLegacyMigrationMarker()
+{
+#ifdef FSCom
+    concurrency::LockGuard g(spiLock);
+    FSCom.mkdir("/prefs");
+    auto f = FSCom.open(legacyMigrationMarkerFileName, FILE_O_WRITE);
+    if (f) {
+        f.write((const uint8_t *)"1", 1);
+        f.close();
+    } else {
+        LOG_WARN("Can't write %s; migration runs without its boot-loop guard", legacyMigrationMarkerFileName);
+    }
+#endif
+}
+
+void NodeDB::clearLegacyMigrationMarker()
+{
+#ifdef FSCom
+    concurrency::LockGuard g(spiLock);
+    if (FSCom.exists(legacyMigrationMarkerFileName))
+        FSCom.remove(legacyMigrationMarkerFileName);
+#endif
+}
+
+void NodeDB::finishPendingMigrationSave()
+{
+    if (!migrationSavePending)
+        return;
+    saveNodeDatabaseToDisk();
+    migrationSavePending = false;
+    // Reaching here means the migration and its save did not crash; a failed save just retries
+    // the migration on the next boot.
+    clearLegacyMigrationMarker();
 }

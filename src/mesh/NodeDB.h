@@ -127,6 +127,7 @@ extern meshtastic_Position localPosition;
 static constexpr const char *deviceStateFileName = "/prefs/device.proto";
 static constexpr const char *legacyPrefFileName = "/prefs/db.proto";
 static constexpr const char *nodeDatabaseFileName = "/prefs/nodes.proto";
+static constexpr const char *legacyMigrationMarkerFileName = "/prefs/nodes.migrating"; // see migrateLegacyNodeDatabase()
 // Event builds isolate radio profiles so normal firmware resumes its config and channels after OTA.
 static constexpr const char *STANDARD_CONFIG_FILE_NAME = "/prefs/config.proto";
 static constexpr const char *STANDARD_CHANNEL_FILE_NAME = "/prefs/channels.proto";
@@ -818,6 +819,15 @@ class NodeDB
     // the legacy descriptor and copies entries into the v25 layout. Caller
     // is responsible for save / install-default on the result.
     bool migrateLegacyNodeDatabase();
+
+    // Boot-loop guard: a marker written before the migration and cleared once the v25 store is
+    // saved. Finding it next to a still-legacy store means the previous attempt crashed.
+    bool legacyMigrationMarkerPresent();
+    void writeLegacyMigrationMarker();
+    void clearLegacyMigrationMarker();
+
+    /// Save the store migrated (or reset) by loadFromDisk(), then drop the boot-loop guard.
+    void finishPendingMigrationSave();
 
     // Route satellite-store decode entries straight into our maps instead of
     // temp vectors. Must be paired - disarm before any other NodeDatabase decode.

@@ -550,10 +550,7 @@ NodeDB::NodeDB()
 
     // If we migrated from legacy during loadFromDisk(), persist the migrated DB
     // only after identity and self-care are established.
-    if (migrationSavePending) {
-        saveNodeDatabaseToDisk();
-        migrationSavePending = false;
-    }
+    finishPendingMigrationSave();
 
     // If node database has not been saved for the first time, save it now
 #ifdef FSCom
@@ -1002,7 +999,9 @@ void NodeDB::installDefaultNodeDatabase()
 {
     LOG_DEBUG("Install default NodeDatabase");
     nodeDatabase.version = DEVICESTATE_CUR_VER;
-    nodeDatabase.nodes = std::vector<meshtastic_NodeInfoLite>(MAX_NUM_NODES);
+    // Free the old table before allocating; this is the low-memory fallback path, so never hold two.
+    std::vector<meshtastic_NodeInfoLite>().swap(nodeDatabase.nodes);
+    nodeDatabase.nodes.resize(MAX_NUM_NODES);
     numMeshNodes = 0;
     meshNodes = &nodeDatabase.nodes;
     concurrency::LockGuard satelliteGuard(&satelliteMutex);
@@ -2624,11 +2623,18 @@ void NodeDB::loadFromDisk()
         LOG_WARN("NodeDatabase %d is old, discard", nodeDatabase.version);
         installDefaultNodeDatabase();
     } else if (nodeDatabase.version < DEVICESTATE_CUR_VER) {
-        if (migrateLegacyNodeDatabase())
-            migrationSavePending = true;
-        else
+        if (legacyMigrationMarkerPresent()) {
+            // The last attempt never reached its save (crash, OOM assert, power loss). Retrying
+            // would boot-loop a node that may only be reachable over the air, so give up the store.
+            LOG_ERROR("NodeDatabase v%u migration did not finish last boot; discarding legacy store", nodeDatabase.version);
             installDefaultNodeDatabase();
+        } else if (!migrateLegacyNodeDatabase()) {
+            installDefaultNodeDatabase();
+        }
+        // Either way, overwrite the legacy file so the next boot doesn't take this branch again.
+        migrationSavePending = true;
     } else {
+        clearLegacyMigrationMarker(); // crashed between the migrated save and dropping the guard
         meshNodes = &nodeDatabase.nodes;
         numMeshNodes = nodeDatabase.nodes.size();
         // Counts computed outside LOG_INFO() so cppcheck doesn't choke on #if in macro args.
@@ -3101,10 +3107,7 @@ bool NodeDB::reloadFromDisk()
     nodeDBSelfCare();
 
     // Preserve constructor ordering: persist any migration only after self-care.
-    if (migrationSavePending) {
-        saveNodeDatabaseToDisk();
-        migrationSavePending = false;
-    }
+    finishPendingMigrationSave();
 
     // Push the now-real config to the radio.
     if (rIface) {

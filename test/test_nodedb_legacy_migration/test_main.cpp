@@ -157,6 +157,46 @@ void assertValidUtf8(const char *s, size_t width)
     TEST_ASSERT_FALSE_MESSAGE(sanitizeUtf8(copy, width), "migrated name still contains invalid UTF-8");
 }
 
+bool markerPresent()
+{
+    return FSCom.exists(legacyMigrationMarkerFileName);
+}
+
+void writeMarker()
+{
+    auto f = FSCom.open(legacyMigrationMarkerFileName, FILE_O_WRITE);
+    TEST_ASSERT_TRUE((bool)f);
+    f.write((const uint8_t *)"1", 1);
+    f.close();
+}
+
+meshtastic_NodeDatabase reloadNodesFile()
+{
+    meshtastic_NodeDatabase reloaded{};
+    TEST_ASSERT_EQUAL(LoadFileResult::LOAD_SUCCESS,
+                      db->loadProto(nodeDatabaseFileName, db->getMaxNodesAllocatedSize(), sizeof(meshtastic_NodeDatabase),
+                                    &meshtastic_NodeDatabase_msg, &reloaded));
+    return reloaded;
+}
+
+/// A legacy node carrying everything a busy 2.7 store holds per entry: user, key, position, metrics.
+meshtastic_NodeInfoLite_Legacy makeFullLegacyNode(uint32_t num, uint32_t lastHeard, int i)
+{
+    auto n = makeLegacyNode(num, lastHeard);
+    char ln[16], sn[5];
+    snprintf(ln, sizeof(ln), "full%d", i);
+    snprintf(sn, sizeof(sn), "%02d", i % 100);
+    giveLegacyUser(n, ln, sn);
+    fillKey(n.user.public_key, (uint8_t)(i + 1));
+    n.has_position = true;
+    n.position.latitude_i = 500000000 + i;
+    n.position.longitude_i = 190000000 + i;
+    n.has_device_metrics = true;
+    n.device_metrics.has_battery_level = true;
+    n.device_metrics.battery_level = (uint32_t)(i % 100);
+    return n;
+}
+
 } // namespace
 
 void setUp(void) {}
@@ -206,7 +246,8 @@ static void test_v24RoundTrip_migratesFieldsBitfieldAndSatellites(void)
 {
     std::vector<meshtastic_NodeInfoLite_Legacy> nodes;
 
-    // Node A: every scalar populated, plus position + device_metrics.
+    // Node A: every scalar populated, plus position + device_metrics. First in the file, so it
+    // migrates in the self slot without being protected; B..E survive by being protected.
     auto a = makeLegacyNode(0xA1000001, 111111);
     giveLegacyUser(a, "Alice Node", "AL");
     a.user.hw_model = meshtastic_HardwareModel_TBEAM;
@@ -248,6 +289,7 @@ static void test_v24RoundTrip_migratesFieldsBitfieldAndSatellites(void)
     // Node D: tri-state unmessagable present-and-set.
     auto d = makeLegacyNode(0xA1000004, 444444);
     giveLegacyUser(d, "Dave", "DD");
+    d.is_favorite = true;
     d.user.has_is_unmessagable = true;
     d.user.is_unmessagable = true;
     nodes.push_back(d);
@@ -255,6 +297,7 @@ static void test_v24RoundTrip_migratesFieldsBitfieldAndSatellites(void)
     // Node E: control - no key, no bools, no unmessagable tri-state.
     auto e = makeLegacyNode(0xA1000005, 555555);
     giveLegacyUser(e, "Erin", "EE");
+    e.is_favorite = true;
     nodes.push_back(e);
 
     writeLegacyNodesFile(24, nodes);
@@ -362,6 +405,7 @@ static void test_absentSubmessages_noSatelliteGhostRows(void)
     giveLegacyUser(a, "NoPos", "NP");
     auto b = makeLegacyNode(0xC3000002, 2000);
     giveLegacyUser(b, "NoTel", "NT");
+    b.is_favorite = true;
     writeLegacyNodesFile(24, {a, b});
     coldBoot();
 
@@ -429,6 +473,7 @@ static void test_rawInvalidUtf8Node_droppedWithoutBreakingMigration(void)
 
     auto good = makeLegacyNode(0xB2000003, 3000);
     giveLegacyUser(good, "Good Node", "GN");
+    good.is_favorite = true; // the poisoned node's decode fragment can take the self slot
 
     std::vector<uint8_t> buf = encodeLegacyNodes(24, {h, good});
     patchBytes(buf, kPlaceholderLong, kHostileLong, 15);
@@ -458,38 +503,41 @@ static void test_rawInvalidUtf8Node_droppedWithoutBreakingMigration(void)
 
 // A legacy file from a larger-cap build migrates at most MAX_NUM_NODES entries
 // in file order; no OOB under ASan (the getOrCreate boot-loop family guard).
+// Shaped like a real v24 file: self first, then more protected nodes than fit.
 static void test_overCapLegacyFile_truncatesToMaxNumNodes(void)
 {
     const int maxNodes = MAX_NUM_NODES;
     const int extra = 20;
+    const NodeNum self = db->getNodeNum();
     std::vector<meshtastic_NodeInfoLite_Legacy> nodes;
     nodes.reserve(maxNodes + extra);
-    for (int i = 0; i < maxNodes + extra; i++) {
-        auto n = makeLegacyNode(0xE5000000u + i, (uint32_t)(i + 1)); // ascending: index 0 is oldest
+    auto me = makeLegacyNode(self, 1);
+    giveLegacyUser(me, "me", "ME");
+    nodes.push_back(me);
+    for (int i = 1; i < maxNodes + extra; i++) {
+        auto n = makeLegacyNode(0xE5000000u + i, (uint32_t)(i + 1));
         char ln[16], sn[5];
         snprintf(ln, sizeof(ln), "n%d", i);
         snprintf(sn, sizeof(sn), "%02d", i % 100);
         giveLegacyUser(n, ln, sn); // users required: keyless/userless entries are purged by cleanupMeshDB
+        n.is_favorite = true;      // only protected nodes migrate past the self slot
         nodes.push_back(n);
     }
     writeLegacyNodesFile(24, nodes);
     coldBoot();
 
-    // Exactly the hot cap: file entries 0..max-1 migrated, the tail dropped,
-    // then nodeDBSelfCare evicted one old migrated node to admit self. Which
-    // of the oldest is the victim is an eviction-policy detail; only the
-    // counts and the cap boundary are contract here.
+    // Exactly the hot cap: file entries 0..max-1 migrated, the tail dropped.
     TEST_ASSERT_EQUAL_INT(maxNodes, (int)db->getNumMeshNodes());
     TEST_ASSERT_NULL(db->getMeshNode(0xE5000000u + maxNodes));             // first beyond the cap: dropped
     TEST_ASSERT_NULL(db->getMeshNode(0xE5000000u + maxNodes + extra - 1)); // last beyond the cap: dropped
     TEST_ASSERT_NOT_NULL(db->getMeshNode(0xE5000000u + maxNodes - 1));     // last within the cap: kept
-    TEST_ASSERT_NOT_NULL(db->getMeshNode(db->getNodeNum()));               // self admitted
+    TEST_ASSERT_NOT_NULL(db->getMeshNode(self));
     int survivors = 0;
-    for (int i = 0; i < maxNodes; i++) {
+    for (int i = 1; i < maxNodes; i++) {
         if (db->getMeshNode(0xE5000000u + i))
             survivors++;
     }
-    TEST_ASSERT_EQUAL_INT_MESSAGE(maxNodes - 1, survivors, "exactly one within-cap node should have been evicted for self");
+    TEST_ASSERT_EQUAL_INT_MESSAGE(maxNodes - 1, survivors, "every within-cap protected node should have migrated");
 }
 
 // --- Full boot ladder persistence ---
@@ -543,6 +591,90 @@ static void test_fullBootLadder_persistsMigratedV25(void)
 #endif
 }
 
+// --- Protected-only migration ---
+
+// The field failure: a full 160-node 2.7 store OOM-asserted the 2.8 boot into a loop. Now only
+// our own record (first in the file) and favorite / ignored / key-verified nodes migrate, and
+// the rest are dropped during the decode. Our record must keep its position: on a GPS-less node
+// that is where the fixed position lives.
+static void test_fullLegacyStore_keepsOnlySelfAndProtected(void)
+{
+    const int maxNodes = MAX_NUM_NODES;
+    const NodeNum self = db->getNodeNum();
+    std::vector<meshtastic_NodeInfoLite_Legacy> nodes;
+    nodes.reserve(maxNodes);
+    nodes.push_back(makeFullLegacyNode(self, 0, 0));
+    for (int i = 1; i < maxNodes; i++)
+        nodes.push_back(makeFullLegacyNode(0xF1000000u + i, 1000u + i, i));
+    nodes[10].is_favorite = true;
+    nodes[20].is_ignored = true;
+    nodes[30].bitfield |= NODEINFO_BITFIELD_IS_KEY_MANUALLY_VERIFIED_MASK;
+    writeLegacyNodesFile(24, nodes);
+    coldBoot();
+
+    assertBootKeygenRan();
+    TEST_ASSERT_EQUAL_INT(4, (int)db->getNumMeshNodes()); // self + favorite + ignored + verified
+    TEST_ASSERT_NOT_NULL(db->getMeshNode(0xF1000000u + 10));
+    TEST_ASSERT_TRUE(nodeInfoLiteIsFavorite(db->getMeshNode(0xF1000000u + 10)));
+    TEST_ASSERT_NOT_NULL(db->getMeshNode(0xF1000000u + 20));
+    TEST_ASSERT_TRUE_MESSAGE(nodeInfoLiteIsIgnored(db->getMeshNode(0xF1000000u + 20)),
+                             "a blocked node must stay blocked across the upgrade");
+    TEST_ASSERT_NOT_NULL(db->getMeshNode(0xF1000000u + 30));
+    TEST_ASSERT_TRUE(nodeInfoLiteIsKeyManuallyVerified(db->getMeshNode(0xF1000000u + 30)));
+    TEST_ASSERT_NULL(db->getMeshNode(0xF1000000u + 1));
+    TEST_ASSERT_NULL(db->getMeshNode(0xF1000000u + maxNodes - 1));
+#if !MESHTASTIC_EXCLUDE_POSITIONDB
+    meshtastic_PositionLite pos;
+    TEST_ASSERT_TRUE_MESSAGE(db->copyNodePosition(self, pos), "own (fixed) position lost in migration");
+    TEST_ASSERT_EQUAL_INT32(500000000, pos.latitude_i);
+    TEST_ASSERT_TRUE(db->hasNodePosition(0xF1000000u + 10)); // a kept node keeps its satellites
+    TEST_ASSERT_FALSE(db->hasNodePosition(0xF1000000u + 1)); // a dropped one leaves no orphan
+#endif
+    TEST_ASSERT_FALSE_MESSAGE(markerPresent(), "a finished migration must drop its boot-loop guard");
+    TEST_ASSERT_EQUAL_UINT32(DEVICESTATE_CUR_VER, reloadNodesFile().version);
+}
+
+// --- Boot-loop guard ---
+
+// A marker beside a still-v24 store means the last attempt died before its save. The boot must
+// give up the store instead of retrying, persist a v25 file, and drop the marker - otherwise a
+// node that can only be reached over the air loops forever.
+static void test_unfinishedMigrationMarker_discardsLegacyStoreAndBoots(void)
+{
+    auto n = makeFullLegacyNode(0xF3000001, 5000, 1);
+    n.is_favorite = true;
+    writeLegacyNodesFile(24, {n});
+    writeMarker();
+    coldBoot();
+
+    assertBootKeygenRan();
+    TEST_ASSERT_NULL(db->getMeshNode(0xF3000001));
+    TEST_ASSERT_EQUAL_INT(1, (int)db->getNumMeshNodes()); // self only
+    TEST_ASSERT_FALSE(markerPresent());
+    TEST_ASSERT_EQUAL_UINT32(DEVICESTATE_CUR_VER, reloadNodesFile().version);
+
+    // And the following boot is an ordinary v25 boot.
+    coldBoot();
+    TEST_ASSERT_EQUAL_INT(1, (int)db->getNumMeshNodes());
+    TEST_ASSERT_FALSE(markerPresent());
+}
+
+// Crash window between the migrated save and dropping the marker: the store is already v25, so
+// the marker is stale and must be removed without touching the nodes.
+static void test_staleMarkerBesideV25Store_clearedAndNodesKept(void)
+{
+    auto n = makeFullLegacyNode(0xF4000001, 6000, 1);
+    n.is_favorite = true;
+    writeLegacyNodesFile(24, {n});
+    coldBoot(); // migrates and saves v25
+    TEST_ASSERT_NOT_NULL(db->getMeshNode(0xF4000001));
+
+    writeMarker();
+    coldBoot();
+    TEST_ASSERT_FALSE(markerPresent());
+    TEST_ASSERT_NOT_NULL(db->getMeshNode(0xF4000001));
+}
+
 NDBM_TEST_ENTRY void setup()
 {
     initializeTestEnvironment();
@@ -569,6 +701,11 @@ NDBM_TEST_ENTRY void setup()
     printf("\n=== Capacity and persistence ===\n");
     RUN_TEST(test_overCapLegacyFile_truncatesToMaxNumNodes);
     RUN_TEST(test_fullBootLadder_persistsMigratedV25);
+
+    printf("\n=== Protected-only migration and boot-loop guard ===\n");
+    RUN_TEST(test_fullLegacyStore_keepsOnlySelfAndProtected);
+    RUN_TEST(test_unfinishedMigrationMarker_discardsLegacyStoreAndBoots);
+    RUN_TEST(test_staleMarkerBesideV25Store_clearedAndNodesKept);
 
     exit(UNITY_END());
 }
