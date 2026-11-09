@@ -28,6 +28,8 @@ struct DMShellSession {
     uint32_t sessionId = 0;
     NodeNum peer = 0;
     uint8_t channel = 0;
+    // Hop limit our frames go out with: one more than the peer's last frame took to reach us, capped.
+    uint8_t replyHopLimit = 1;
     int masterFd = -1;
     int childPid = -1;
     // masterFd is nonblocking, so write() can take only part of an INPUT frame. The rest waits here
@@ -102,6 +104,8 @@ class DMShellModule : private concurrency::OSThread, public SinglePortModule
     uint32_t maxConsecutiveRetransmits = 0;
     // Set once at construction from DMSHELL_LEGACY_RECOVERY; see the constructor.
     bool legacyRecovery = false;
+    // Reply hop limit for the frame being handled, for sessionless replies to a peer other than session.peer.
+    uint8_t rxReplyHopLimit = 1;
 
     uint32_t replayRequestIntervalMs() const;
     void notePeerReceiveCursor(const meshtastic_RemoteShell &frame);

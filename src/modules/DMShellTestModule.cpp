@@ -3,6 +3,7 @@
 #ifdef DMSHELL_TEST_PEER
 
 #include "MeshService.h"
+#include "NodeDB.h"
 #include "Throttle.h"
 #include "configuration.h"
 #include "mesh/mesh-pb-constants.h"
@@ -631,10 +632,10 @@ void DMShellTestModule::transmit(const meshtastic_RemoteShell &frame, uint32_t n
         return;
     }
     p->decoded.payload.size = encoded;
-    // As the client's packets go out: direct, no routing ACK, encrypted to the peer's key so the server authorises us
+    // As the client's packets go out: configured hop limit capped, no routing ACK, encrypted to the peer's key so the
+    // server authorises us
     p->to = DMSHELL_TEST_PEER;
-    p->hop_limit = 0;
-    p->hop_start = 0;
+    p->hop_limit = dmshellRequestHopLimit(config.lora.hop_limit);
     p->channel = 0;
     p->want_ack = false;
     p->pki_encrypted = true;

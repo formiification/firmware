@@ -453,3 +453,23 @@ inline bool retransmitDue(uint32_t nowMs, uint32_t lastSentMs, uint32_t interval
 {
     return (uint32_t)(nowMs - lastSentMs) >= intervalMs;
 }
+
+/// Ceiling on the hop limit either end of a DMShell session sends with.
+constexpr uint8_t DMSHELL_MAX_HOP_LIMIT = 4;
+
+/// Hop limit for a frame we originate: the node's configured hop limit, capped at DMSHELL_MAX_HOP_LIMIT.
+inline uint8_t dmshellRequestHopLimit(uint8_t configured)
+{
+    return configured < DMSHELL_MAX_HOP_LIMIT ? configured : DMSHELL_MAX_HOP_LIMIT;
+}
+
+/// Hop limit for a reply to a frame that took hopsAway hops to reach us: one more than that, so a direct
+/// peer is answered with 1, capped at DMSHELL_MAX_HOP_LIMIT. hopsAway < 0 (unknown) falls back to the
+/// capped configured limit.
+inline uint8_t dmshellReplyHopLimit(int8_t hopsAway, uint8_t configured)
+{
+    if (hopsAway < 0) {
+        return dmshellRequestHopLimit(configured);
+    }
+    return hopsAway + 1 < DMSHELL_MAX_HOP_LIMIT ? (uint8_t)(hopsAway + 1) : DMSHELL_MAX_HOP_LIMIT;
+}

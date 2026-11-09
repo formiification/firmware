@@ -175,9 +175,11 @@ ProcessMessage DMShellModule::handleReceived(const meshtastic_MeshPacket &mp)
         LOG_WARN("DMShell: ignoring malformed frame");
         return ProcessMessage::STOP;
     }
+    rxReplyHopLimit = dmshellReplyHopLimit(getHopsAway(mp), config.lora.hop_limit);
 
     if (frame.op == meshtastic_RemoteShell_OpCode_ACK) {
         if (session.active && frame.session_id == session.sessionId && getFrom(&mp) == session.peer) {
+            session.replyHopLimit = rxReplyHopLimit;
             // A bare ACK carries no sequence number of its own and never reaches the ordered path
             // below, so this is the only place its receive cursor can be read. It is also the only
             // signal a peer with nothing to say can give us, and therefore the one that keeps the
@@ -236,6 +238,7 @@ ProcessMessage DMShellModule::handleReceived(const meshtastic_MeshPacket &mp)
     // receive cursor - during a gap it may be the only kind of frame arriving, and the cursor is what
     // reopens our send window.
     session.lastActivityMs = millis();
+    session.replyHopLimit = rxReplyHopLimit;
     notePeerReceiveCursor(frame);
 
     // A teardown must not sit behind a gap. The session checks above have already established that
@@ -558,6 +561,7 @@ bool DMShellModule::openSession(const meshtastic_MeshPacket &mp, const meshtasti
     session.sessionId = (frame.session_id != 0) ? frame.session_id : static_cast<uint32_t>(random(1, 0x7fffffff));
     session.peer = getFrom(&mp);
     session.channel = mp.channel;
+    session.replyHopLimit = rxReplyHopLimit;
     session.masterFd = masterFd;
     session.childPid = childPid;
     session.nextTxSeq = 1;
@@ -1124,8 +1128,7 @@ void DMShellModule::sendFrameToPeer(NodeNum peer, meshtastic_RemoteShell frame, 
     }
 
     packet->to = peer;
-    packet->hop_limit = 0;
-    packet->hop_start = 0;
+    packet->hop_limit = (session.active && peer == session.peer) ? session.replyHopLimit : rxReplyHopLimit;
     packet->channel = 0;
     packet->want_ack = false;
     packet->pki_encrypted = true;

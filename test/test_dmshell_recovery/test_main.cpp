@@ -760,6 +760,32 @@ void test_dmshell_retransmit_due_survives_millis_wrap()
     TEST_ASSERT_TRUE(retransmitDue(sent + 1400, sent, 1400));
 }
 
+// A request goes out with the node's configured hop limit, never above the DMShell ceiling of 4
+void test_dmshell_request_hop_limit_is_configured_capped_at_four()
+{
+    TEST_ASSERT_EQUAL_UINT8(0, dmshellRequestHopLimit(0));
+    TEST_ASSERT_EQUAL_UINT8(2, dmshellRequestHopLimit(2));
+    TEST_ASSERT_EQUAL_UINT8(4, dmshellRequestHopLimit(4));
+    TEST_ASSERT_EQUAL_UINT8(4, dmshellRequestHopLimit(7));
+}
+
+// A reply goes out with one hop more than the request took, so a direct peer gets 1, capped at 4
+void test_dmshell_reply_hop_limit_is_hops_away_plus_one_capped_at_four()
+{
+    TEST_ASSERT_EQUAL_UINT8(1, dmshellReplyHopLimit(0, 7));
+    TEST_ASSERT_EQUAL_UINT8(3, dmshellReplyHopLimit(2, 7));
+    TEST_ASSERT_EQUAL_UINT8(4, dmshellReplyHopLimit(3, 7));
+    TEST_ASSERT_EQUAL_UINT8(4, dmshellReplyHopLimit(4, 7));
+    TEST_ASSERT_EQUAL_UINT8(4, dmshellReplyHopLimit(6, 1));
+}
+
+// When the hop count cannot be read, the reply falls back to the capped configured hop limit
+void test_dmshell_reply_hop_limit_unknown_hops_uses_capped_configured()
+{
+    TEST_ASSERT_EQUAL_UINT8(2, dmshellReplyHopLimit(-1, 2));
+    TEST_ASSERT_EQUAL_UINT8(4, dmshellReplyHopLimit(-1, 7));
+}
+
 void setup()
 {
     initializeTestEnvironment();
@@ -811,6 +837,9 @@ void setup()
     RUN_TEST(test_dmshell_ack_latency_interval_is_twice_the_estimate_within_bounds);
     RUN_TEST(test_dmshell_retransmit_waits_for_the_frame_not_the_poll);
     RUN_TEST(test_dmshell_retransmit_due_survives_millis_wrap);
+    RUN_TEST(test_dmshell_request_hop_limit_is_configured_capped_at_four);
+    RUN_TEST(test_dmshell_reply_hop_limit_is_hops_away_plus_one_capped_at_four);
+    RUN_TEST(test_dmshell_reply_hop_limit_unknown_hops_uses_capped_configured);
     exit(UNITY_END());
 }
 

@@ -36,23 +36,11 @@ MAX_STREAM_FRAME = 512
 STREAM_RESYNC = {"stray_bytes": 0, "bad_header": 0, "bad_start2": 0}
 HEADER_LEN = 4
 DEFAULT_API_PORT = 4403
-# Zero, and this is about airtime rather than reachability. A non-zero hop limit arms two
-# mechanisms in the firmware that DMShell wants nothing from. NextHopRouter::sendWithNextHop starts
-# its own relay retransmissions for the packet - its gate is (hop_limit > 0 || want_ack) with a
-# known next hop - and those repeats reuse the packet id, so the far end discards them in
-# shouldFilterReceived as dupes after paying for them on the air. Then, to stop them,
-# ReliableRouter::sniffReceived answers every single frame with a 0-hop routing ACK, which is an
-# extra transmission from the peer in the same direction as its own shell output, on a half-duplex
-# channel. Neither is visible to this protocol: DMShell carries its own sequence numbers and
-# cursors, and sets want_ack = False for exactly that reason.
-#
-# Zero is also symmetric with the firmware, which already sends its side of the session with
-# hop_limit = 0, so DMShell is a direct-neighbour protocol in both directions either way. It
-# survives the receiver's pre-hop drop policy because hop_start == 0 is accepted when the Data
-# bitfield is present (classifyHopStart in NodeDB.cpp) and perhapsEncode sets that on every
-# locally-originated packet - which is what makes the firmware's own hop_limit = 0 frames arrive
-# here. Raise it with --hop-limit only to restore the old behaviour for a comparison.
-DEFAULT_HOP_LIMIT = 0
+# DMShell frames go out with the node's configured LoRa hop limit, read from the config handshake, and
+# never above MAX_HOP_LIMIT; the firmware applies the same ceiling to its replies, which it sends with one
+# hop more than our frame took to reach it. Used only when the handshake carried no LoRa config.
+MAX_HOP_LIMIT = 4
+DEFAULT_HOP_LIMIT = 3
 LOCAL_ESCAPE_BYTE = b"\x1d"  # Ctrl+]
 # The floor, and the bootstrap before a single round trip has been observed. It is not the interval:
 # a flat 1 s is shorter than one frame's time on air at LongFast (~2.2 s), so repeating on it queues
@@ -183,9 +171,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hop-limit",
         type=int,
-        default=DEFAULT_HOP_LIMIT,
-        help="hop limit (default %(default)s; non-zero arms the firmware's relay retransmissions "
-        "and makes the peer routing-ACK every frame)",
+        default=None,
+        help=f"hop limit (default: the node's configured LoRa hop limit; capped at {MAX_HOP_LIMIT})",
     )
     parser.add_argument(
         "--peer-log",
@@ -1388,7 +1375,8 @@ def service_input_window(transport, state: SessionState) -> None:
     replay_frames_from(transport, state, missing)
 
 
-def wait_for_config_complete(transport, pb2, timeout: float, verbose: bool) -> None:
+def wait_for_config_complete(transport, pb2, timeout: float, verbose: bool) -> Optional[int]:
+    """Run the config handshake. Returns the node's LoRa hop limit, or None if no LoRa config arrived."""
     nonce = random.randint(1, 0x7FFFFFFF)
     toradio = pb2.mesh.ToRadio()
     toradio.want_config_id = nonce
@@ -1398,6 +1386,7 @@ def wait_for_config_complete(transport, pb2, timeout: float, verbose: bool) -> N
     # a peer that never answers - the wrong --port, a non-Meshtastic service, a serial device that
     # ignores want_config_id - otherwise hangs here for good and --timeout means nothing.
     deadline = time.monotonic() + timeout
+    lora_hop_limit: Optional[int] = None
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -1419,8 +1408,10 @@ def wait_for_config_complete(transport, pb2, timeout: float, verbose: bool) -> N
             variant = fromradio.WhichOneof("payload_variant")
             if verbose and variant:
                 print(f"[api] fromradio {variant}", file=sys.stderr)
+            if variant == "config" and fromradio.config.WhichOneof("payload_variant") == "lora":
+                lora_hop_limit = fromradio.config.lora.hop_limit
             if variant == "config_complete_id" and fromradio.config_complete_id == nonce:
-                return
+                return lora_hop_limit
     finally:
         transport.settimeout(None)
     raise TimeoutError("timed out waiting for config handshake to complete")
@@ -1898,7 +1889,6 @@ def main() -> int:
         target=parse_node_num(args.to),
         channel=args.channel,
         verbose=args.verbose,
-        hop_limit=args.hop_limit,
         legacy_recovery=args.legacy_recovery,
         drop_open_ok=max(0, args.drop_open_ok),
         input_window_frames=0 if args.legacy_recovery else INPUT_WINDOW_FRAMES,
@@ -1916,7 +1906,16 @@ def main() -> int:
 
     transport = open_transport(args)
     try:
-        wait_for_config_complete(transport, pb2, args.timeout, args.verbose)
+        node_hop_limit = wait_for_config_complete(transport, pb2, args.timeout, args.verbose)
+        if args.hop_limit is not None:
+            requested = args.hop_limit
+        elif node_hop_limit is not None:
+            requested = node_hop_limit
+        else:
+            requested = DEFAULT_HOP_LIMIT
+            print(f"[dmshell] node sent no LoRa config, assuming hop limit {requested}", file=sys.stderr)
+        state.hop_limit = max(0, min(requested, MAX_HOP_LIMIT))
+        print(f"[dmshell] sending with hop limit {state.hop_limit}", file=sys.stderr)
 
         reader = threading.Thread(target=reader_loop, args=(transport, state), daemon=True)
         reader.start()
