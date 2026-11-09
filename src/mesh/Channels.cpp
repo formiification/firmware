@@ -101,11 +101,12 @@ void Channels::initDefaultLoraConfig()
 
     loraConfig.modem_preset = meshtastic_Config_LoRaConfig_ModemPreset_LONG_FAST; // Default to Long Range & Fast
     loraConfig.use_preset = true;
-    loraConfig.tx_power = 0; // default
     loraConfig.channel_num = 0;
 
 #ifdef USERPREFS_LORACONFIG_TX_POWER
     loraConfig.tx_power = USERPREFS_LORACONFIG_TX_POWER;
+#else
+    loraConfig.tx_power = 30; // Clamped to the region and radio limits by applyModemConfig()/limitPower()
 #endif
 #ifdef USERPREFS_LORACONFIG_MODEM_PRESET
     loraConfig.modem_preset = USERPREFS_LORACONFIG_MODEM_PRESET;

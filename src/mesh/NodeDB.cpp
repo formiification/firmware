@@ -1197,6 +1197,8 @@ void NodeDB::installDefaultConfig(bool preserveKey = false)
 
 #ifdef USERPREFS_LORACONFIG_TX_POWER
     config.lora.tx_power = USERPREFS_LORACONFIG_TX_POWER;
+#else
+    config.lora.tx_power = 30; // Clamped to the region and radio limits by applyModemConfig()/limitPower()
 #endif
 
 #ifdef USERPREFS_LORACONFIG_MODEM_PRESET
