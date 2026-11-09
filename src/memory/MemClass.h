@@ -41,7 +41,13 @@
 // mesh-pb-constants.h static_asserts their sum, so an oversized cache fails the build.
 // Raising a budget is allowed - as a visible, reviewable one-line diff.
 #ifndef MESHTASTIC_BOOT_CACHE_BUDGET
-#if MESHTASTIC_MEM_CLASS <= MEM_CLASS_TINY
+#if defined(__PLAT_RP2040__) || defined(__PLAT_RP2350__)
+// RP2040 (264 KB SRAM) / RP2350 (520 KB): SMALL class, but with MAX_NUM_NODES 160 the caches
+// need TMM 400*10 + warm 150*40 + packet history 320*20 = 16 400 B, 16 B over the SMALL budget.
+// Raised for RP2xx0 only (nRF52 / classic ESP32 stay at 16 KB), with headroom: 20 KB is <8% of
+// RP2040 SRAM. (__PLAT_* come from the variant -D flags; ARCH_RP2040 is not defined this early.)
+#define MESHTASTIC_BOOT_CACHE_BUDGET (20 * 1024)
+#elif MESHTASTIC_MEM_CLASS <= MEM_CLASS_TINY
 #define MESHTASTIC_BOOT_CACHE_BUDGET (8 * 1024)
 #elif MESHTASTIC_MEM_CLASS == MEM_CLASS_SMALL
 #define MESHTASTIC_BOOT_CACHE_BUDGET (16 * 1024)
