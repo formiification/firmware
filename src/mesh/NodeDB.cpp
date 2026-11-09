@@ -621,7 +621,7 @@ NodeDB::NodeDB()
 #ifdef USERPREFS_FIRMWARE_EDITION
     myNodeInfo.firmware_edition = USERPREFS_FIRMWARE_EDITION;
 #else
-    myNodeInfo.firmware_edition = meshtastic_FirmwareEdition_VANILLA;
+    myNodeInfo.firmware_edition = meshtastic_FirmwareEdition_DIY_EDITION;
 #endif
     pickNewNodeNum();
 
