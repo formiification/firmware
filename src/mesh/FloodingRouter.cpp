@@ -154,20 +154,24 @@ void FloodingRouter::perhapsCancelDupe(const meshtastic_MeshPacket *p)
     if (config.device.role == meshtastic_Config_DeviceConfig_Role_ROUTER_LATE && iface) {
         iface->clampToLateRebroadcastWindow(getFrom(p), p->id);
     }
-    // A kept unicast stays in the early window: it follows one path, and the late window would park it behind every other relay
+    // Only a favorite's non-text broadcast moves late. Kept unicast and channel text stay early: the late window parks
+    // a relay behind every other one, and text arriving minutes late scrambles the order of a conversation
     if (config.device.role == meshtastic_Config_DeviceConfig_Role_CLIENT_BASE && iface && nodeDB && isBroadcast(p->to) &&
-        clientBaseKeepsRelay(p)) {
+        !isBroadcastText(p) && nodeDB->isFromOrToFavoritedNode(*p)) {
         iface->clampToLateRebroadcastWindow(getFrom(p), p->id);
     }
 }
 
-bool FloodingRouter::clientBaseKeepsRelay(const meshtastic_MeshPacket *p)
+bool FloodingRouter::isBroadcastText(const meshtastic_MeshPacket *p)
 {
-    if (nodeDB->isFromOrToFavoritedNode(*p))
-        return true;
-    // The rebroadcast the base overheard may not reach the indoor nodes behind it, so channel text is always carried.
     meshtastic_PortNum port;
     return isBroadcast(p->to) && authenticatedPortnum(*p, &port) && port == meshtastic_PortNum_TEXT_MESSAGE_APP;
+}
+
+bool FloodingRouter::clientBaseKeepsRelay(const meshtastic_MeshPacket *p)
+{
+    // The rebroadcast the base overheard may not reach the indoor nodes behind it, so channel text is always carried.
+    return nodeDB->isFromOrToFavoritedNode(*p) || isBroadcastText(p);
 }
 
 bool FloodingRouter::isRebroadcaster()

@@ -73,6 +73,9 @@ class FloodingRouter : public Router
     // CLIENT_BASE never cancels the relay of packets from/to its favorites or of broadcast TEXT_MESSAGE_APP
     bool clientBaseKeepsRelay(const meshtastic_MeshPacket *p);
 
+    // Broadcast TEXT_MESSAGE_APP, read from the decrypted copy when `p` is still encrypted
+    static bool isBroadcastText(const meshtastic_MeshPacket *p);
+
     /* Call when receiving a duplicate packet to check whether we should cancel a packet in the Tx queue */
     void perhapsCancelDupe(const meshtastic_MeshPacket *p);
 
