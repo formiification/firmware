@@ -4,7 +4,7 @@
 #include "SinglePortModule.h"
 #include "concurrency/OSThread.h"
 
-// PKI DM text commands from an admin key: !list_favorites|!list_ignored [page], !unfav|!unignore !nodeid.
+// PKI DM text commands from an admin key: list/add/remove favorites and ignored, send our NodeInfo, !help.
 // Everyone else is ignored silently; the text is always passed on to the other modules.
 class NodeListCmdModule : public SinglePortModule, private concurrency::OSThread
 {
@@ -33,7 +33,8 @@ class NodeListCmdModule : public SinglePortModule, private concurrency::OSThread
     NodeNum lastListFrom = 0;
 
     void startList(const meshtastic_MeshPacket &mp, ListKind kind, const char *arg);
-    void handleClear(const meshtastic_MeshPacket &mp, ListKind kind, const char *arg);
+    void handleFlag(const meshtastic_MeshPacket &mp, ListKind kind, bool set, const char *arg);
+    void handleNodeInfo(const meshtastic_MeshPacket &mp, const char *arg);
     void sendText(NodeNum to, const uint8_t *key, const char *text);
 };
 

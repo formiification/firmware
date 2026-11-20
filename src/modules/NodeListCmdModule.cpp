@@ -2,12 +2,16 @@
 #if !MESHTASTIC_EXCLUDE_NODELISTCMDS && !MESHTASTIC_EXCLUDE_PKI && !MESHTASTIC_EXCLUDE_TEXTMESSAGE
 #include "NodeListCmdModule.h"
 #include "MeshService.h"
+#include "MessageStore.h"
 #include "NodeDB.h"
 #include "Throttle.h"
 #include "UptimeClock.h"
 #include "gps/RTC.h"
 #include "main.h"
 #include "mesh/AdminKeys.h"
+#if !MESHTASTIC_EXCLUDE_NODEINFO
+#include "modules/NodeInfoModule.h"
+#endif
 
 #include <cctype>
 #include <cstdio>
@@ -120,10 +124,20 @@ ProcessMessage NodeListCmdModule::handleReceived(const meshtastic_MeshPacket &mp
         startList(mp, ListKind::FAVORITES, arg);
     else if ((arg = matchCommand(buf, "!list_ignored")))
         startList(mp, ListKind::IGNORED, arg);
+    else if ((arg = matchCommand(buf, "!addfav")))
+        handleFlag(mp, ListKind::FAVORITES, true, arg);
     else if ((arg = matchCommand(buf, "!unfav")))
-        handleClear(mp, ListKind::FAVORITES, arg);
-    else if ((arg = matchCommand(buf, "!unignore")))
-        handleClear(mp, ListKind::IGNORED, arg);
+        handleFlag(mp, ListKind::FAVORITES, false, arg);
+    else if ((arg = matchCommand(buf, "!addign")))
+        handleFlag(mp, ListKind::IGNORED, true, arg);
+    else if ((arg = matchCommand(buf, "!unignore")) || (arg = matchCommand(buf, "!unign")))
+        handleFlag(mp, ListKind::IGNORED, false, arg);
+    else if ((arg = matchCommand(buf, "!nodeinfo")))
+        handleNodeInfo(mp, arg);
+    else if (matchCommand(buf, "!help"))
+        sendText(mp.from, mp.public_key.bytes,
+                 "!list_favorites [page]\n!list_ignored [page]\n!addfav ID\n!unfav ID\n!addign ID\n!unignore ID\n"
+                 "!nodeinfo ID (send our NodeInfo to ID)\n!help");
 
     return ProcessMessage::CONTINUE;
 }
@@ -210,11 +224,21 @@ int32_t NodeListCmdModule::runOnce()
     return PAGE_INTERVAL_MS;
 }
 
-void NodeListCmdModule::handleClear(const meshtastic_MeshPacket &mp, ListKind kind, const char *arg)
+// Never let a remote command ignore us, the requester or another admin: ignored nodes' packets are dropped.
+static bool isUnignorable(const meshtastic_MeshPacket &mp, NodeNum num)
+{
+    if (num == nodeDB->getNodeNum() || num == mp.from)
+        return true;
+    meshtastic_NodeInfoLite_public_key_t key = {0, {0}};
+    return nodeDB->copyPublicKey(num, key) && key.size == 32 && AdminKeys::isAuthorized(key.bytes);
+}
+
+void NodeListCmdModule::handleFlag(const meshtastic_MeshPacket &mp, ListKind kind, bool set, const char *arg)
 {
     const bool favorites = kind == ListKind::FAVORITES;
-    const char *cmd = favorites ? "unfav" : "unignore";
-    char msg[48];
+    const char *cmd = favorites ? (set ? "addfav" : "unfav") : (set ? "addign" : "unignore");
+    const uint32_t mask = favorites ? NODEINFO_BITFIELD_IS_FAVORITE_MASK : NODEINFO_BITFIELD_IS_IGNORED_MASK;
+    char msg[64];
 
     NodeNum num;
     if (!parseNodeId(arg, num)) {
@@ -222,14 +246,34 @@ void NodeListCmdModule::handleClear(const meshtastic_MeshPacket &mp, ListKind ki
         sendText(mp.from, mp.public_key.bytes, msg);
         return;
     }
+    if (set && !favorites && isUnignorable(mp, num)) {
+        snprintf(msg, sizeof(msg), "REFUSED addign !%08x (self/admin)", num);
+        sendText(mp.from, mp.public_key.bytes, msg);
+        return;
+    }
 
-    meshtastic_NodeInfoLite *node = nodeDB->getMeshNode(num);
+    // Like the admin set_ignored_node, an ignore sticks even for a node we have not heard yet.
+    meshtastic_NodeInfoLite *node = (set && !favorites) ? nodeDB->getOrCreateMeshNode(num) : nodeDB->getMeshNode(num);
     if (!node) {
         snprintf(msg, sizeof(msg), "NO NODE !%08x", num);
-    } else if (!matches(node, favorites)) {
-        snprintf(msg, sizeof(msg), "%s !%08x", favorites ? "NOT FAV" : "NOT IGN", num);
+    } else if (matches(node, favorites) == set) {
+        snprintf(msg, sizeof(msg), "%s %s !%08x", set ? "ALREADY" : "NOT", favorites ? "FAV" : "IGN", num);
     } else {
-        nodeInfoLiteSetBit(node, favorites ? NODEINFO_BITFIELD_IS_FAVORITE_MASK : NODEINFO_BITFIELD_IS_IGNORED_MASK, false);
+        if (set) {
+            if (!nodeDB->setProtectedFlag(node, mask, true)) {
+                snprintf(msg, sizeof(msg), "FULL %s !%08x: protected-node limit", cmd, num);
+                sendText(mp.from, mp.public_key.bytes, msg);
+                return;
+            }
+            if (!favorites) {
+                nodeDB->eraseNodeSatellites(node->num);
+#if HAS_SCREEN || defined(MESHTASTIC_INCLUDE_NICHE_GRAPHICS)
+                messageStore.deleteAllMessagesFromNode(node->num);
+#endif
+            }
+        } else {
+            nodeInfoLiteSetBit(node, mask, false);
+        }
         nodeDB->saveToDisk(SEGMENT_NODEDATABASE);
 #if HAS_SCREEN
         if (screen)
@@ -238,6 +282,31 @@ void NodeListCmdModule::handleClear(const meshtastic_MeshPacket &mp, ListKind ki
         LOG_INFO("NodeListCmd: %s 0x%08x by 0x%08x", cmd, num, mp.from);
         snprintf(msg, sizeof(msg), "OK %s !%08x", cmd, num);
     }
+    sendText(mp.from, mp.public_key.bytes, msg);
+}
+
+void NodeListCmdModule::handleNodeInfo(const meshtastic_MeshPacket &mp, const char *arg)
+{
+    char msg[64];
+    NodeNum num;
+    if (!parseNodeId(arg, num) || num == nodeDB->getNodeNum() || num == NODENUM_BROADCAST) {
+        snprintf(msg, sizeof(msg), "BAD ID %s", arg);
+    }
+#if MESHTASTIC_EXCLUDE_NODEINFO
+    else {
+        snprintf(msg, sizeof(msg), "NO NODEINFO MODULE");
+    }
+#else
+    else if (!nodeInfoModule) {
+        snprintf(msg, sizeof(msg), "NO NODEINFO MODULE");
+    } else if (nodeInfoModule->sendOurNodeInfo(num, false, 0, true)) {
+        LOG_INFO("NodeListCmd: nodeinfo to 0x%08x by 0x%08x", num, mp.from);
+        snprintf(msg, sizeof(msg), "OK nodeinfo -> !%08x", num);
+    } else {
+        // sendOurNodeInfo() holds back a repeat within 60 s and any send above the channel-utilisation cap.
+        snprintf(msg, sizeof(msg), "SKIP nodeinfo -> !%08x (sent <60s ago or channel busy)", num);
+    }
+#endif
     sendText(mp.from, mp.public_key.bytes, msg);
 }
 
