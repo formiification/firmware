@@ -137,7 +137,7 @@ ProcessMessage NodeListCmdModule::handleReceived(const meshtastic_MeshPacket &mp
     else if (matchCommand(buf, "!help"))
         sendText(mp.from, mp.public_key.bytes,
                  "!list_favorites [page]\n!list_ignored [page]\n!addfav ID\n!unfav ID\n!addign ID\n!unignore ID\n"
-                 "!nodeinfo ID (send our NodeInfo to ID)\n!help");
+                 "!nodeinfo ID (exchange NodeInfo with ID)\n!help");
 
     return ProcessMessage::CONTINUE;
 }
@@ -299,9 +299,9 @@ void NodeListCmdModule::handleNodeInfo(const meshtastic_MeshPacket &mp, const ch
 #else
     else if (!nodeInfoModule) {
         snprintf(msg, sizeof(msg), "NO NODEINFO MODULE");
-    } else if (nodeInfoModule->sendOurNodeInfo(num, false, 0, true)) {
+    } else if (nodeInfoModule->sendOurNodeInfo(num, true, 0, true)) {
         LOG_INFO("NodeListCmd: nodeinfo to 0x%08x by 0x%08x", num, mp.from);
-        snprintf(msg, sizeof(msg), "OK nodeinfo -> !%08x", num);
+        snprintf(msg, sizeof(msg), "OK nodeinfo -> !%08x, reply requested", num);
     } else {
         // sendOurNodeInfo() holds back a repeat within 60 s and any send above the channel-utilisation cap.
         snprintf(msg, sizeof(msg), "SKIP nodeinfo -> !%08x (sent <60s ago or channel busy)", num);
