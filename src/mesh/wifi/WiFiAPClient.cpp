@@ -125,6 +125,9 @@ bool initEthernet()
 {
     if (!config.network.eth_enabled)
         return false;
+#if HAS_UDP_UNICAST_PEERS
+    udppeers::setVendorClass();
+#endif
 
     // Register before begin(): static config can fire ETH_GOT_IP immediately
     WiFi.onEvent(WiFiEvent);
@@ -153,6 +156,9 @@ bool initEthernet()
 {
     if (!config.network.eth_enabled)
         return false;
+#if HAS_UDP_UNICAST_PEERS
+    udppeers::setVendorClass();
+#endif
 
     // Configure CH390
     ch390_config_t ch390_conf = CH390_DEFAULT_CONFIG();
@@ -391,6 +397,9 @@ bool initWifi()
             getMacAddr(dmac);
             snprintf(ourHost, sizeof(ourHost), "Meshtastic-%02x%02x", dmac[4], dmac[5]);
 
+#if HAS_UDP_UNICAST_PEERS
+            udppeers::setVendorClass();
+#endif
             WiFi.mode(WIFI_STA);
             WiFi.setHostname(ourHost);
 

@@ -4,8 +4,9 @@
 import json
 import re
 import sys
+import shutil
 from os import remove
-from os.path import getmtime, isfile, join
+from os.path import getmtime, isdir, isfile, join
 
 Import("env")
 
@@ -165,6 +166,11 @@ def tag_sdkconfig_cache_key(env):
     if SDKCONFIG_CACHE_KEY in current:
         return
     marker = "# %s: %s" % (SDKCONFIG_CACHE_KEY, spiram_cache_class(env))
+    cmake_args = env.BoardConfig().get("build.cmake_extra_args", "")
+    if (
+        cmake_args
+    ):  # they and the .dummy/ hook below shape the IDF libs, so a change must rebuild them
+        marker += " cmake=%s idfhook=1" % cmake_args
     config.set(section, "custom_sdkconfig", current.rstrip("\n") + "\n" + marker)
 
 
@@ -236,3 +242,52 @@ def scope_src_filter_in_lib_pass(env):
 
 
 scope_src_filter_in_lib_pass(env)
+
+
+# board_build.cmake_extra_args can set MESHTASTIC_IDF_DEFINES, compile definitions for every IDF component
+# in the libs build (e.g. lwIP options without a Kconfig). espidf.py drops CMAKE_C_FLAGS and builds the libs
+# from the .dummy/ component it copies only when missing, so seed .dummy/ here and append the hook to it.
+# The hook also fixes IDF 5.5's lwip_default_hooks.h, which declares lwip_dhcp_on_extra_option() without a
+# prior `struct dhcp` and so fails to compile once the DHCP extra-option hook is enabled.
+IDF_HOOK_MARKER = (
+    "# meshtastic-idf-hook v1"  # bump together with idfhook= in the cache key
+)
+IDF_HOOK = IDF_HOOK_MARKER + """
+if(MESHTASTIC_IDF_DEFINES)
+    idf_build_set_property(COMPILE_DEFINITIONS "${MESHTASTIC_IDF_DEFINES}" APPEND)
+endif()
+if(CONFIG_LWIP_HOOK_DHCP_EXTRA_OPTION_CUSTOM OR CONFIG_LWIP_HOOK_DHCP_EXTRA_OPTION_DEFAULT)
+    # lwip's target exists only once all components are added; EVAL bakes the values in now
+    idf_component_get_property(meshtastic_lwip_lib lwip COMPONENT_LIB)
+    cmake_language(EVAL CODE "cmake_language(DEFER DIRECTORY \\"${CMAKE_SOURCE_DIR}\\" CALL target_compile_options ${meshtastic_lwip_lib} PRIVATE \\"-include${CMAKE_CURRENT_LIST_DIR}/lwip_struct_dhcp.h\\")")
+endif()
+"""
+
+
+def seed_dummy_component(env):
+    if "MESHTASTIC_IDF_DEFINES" not in env.BoardConfig().get(
+        "build.cmake_extra_args", ""
+    ):
+        return
+    dummy = join(env.subst("$PROJECT_DIR"), ".dummy")
+    if not isdir(dummy):
+        template = join(env.PioPlatform().get_dir(), "builder", "build_lib")
+        if not isdir(template):
+            print(
+                "Warning: %s missing, IDF libs build without the Meshtastic hook"
+                % template
+            )
+            return
+        shutil.copytree(template, dummy)
+    with open(join(dummy, "lwip_struct_dhcp.h"), "w") as f:
+        f.write("struct dhcp;\n")
+    cmake = join(dummy, "CMakeLists.txt")
+    with open(cmake) as f:
+        content = f.read()
+    if IDF_HOOK_MARKER not in content:
+        content = content.split("\nif(MESHTASTIC_IDF_DEFINES)")[0].rstrip("\n") + "\n"
+        with open(cmake, "w") as f:
+            f.write(content + "\n" + IDF_HOOK)
+
+
+seed_dummy_component(env)

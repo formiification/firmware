@@ -3,6 +3,7 @@
 #include "configuration.h"
 #include "main.h"
 #include "mesh/Router.h"
+#include "mesh/udp/UdpPeers.h"
 
 #if HAS_ETHERNET && defined(ARCH_NRF52)
 #include "mesh/eth/ethClient.h"
@@ -92,6 +93,19 @@ class UdpMulticastHandler final
                 LOG_WARN("UDP packet with invalid hop_limit(%u) or hop_start(%u), dropping", mp.hop_limit, mp.hop_start);
                 return;
             }
+#if HAS_UDP_UNICAST_PEERS
+            if (!packet.isMulticast()) {
+                IPAddress src = packet.remoteIP();
+                uint8_t b[4] = {src[0], src[1], src[2], src[3]};
+                uint32_t srcAddr;
+                memcpy(&srcAddr, b, 4);
+                if (!udppeers::isPrivate(srcAddr)) {
+                    LOG_WARN("UDP unicast from non-RFC1918 %s, dropping", src.toString().c_str());
+                    return;
+                }
+                udppeers::noteSource(mp.from, mp.id, srcAddr);
+            }
+#endif
             mp.transport_mechanism = meshtastic_MeshPacket_TransportMechanism_TRANSPORT_MULTICAST_UDP;
             // Authentication metadata is local-only; Router re-establishes it after successful PKI decryption.
             mp.pki_encrypted = false;
@@ -142,10 +156,42 @@ class UdpMulticastHandler final
         LOG_DEBUG("Broadcasting packet over UDP (id=%u)", mp->id);
         uint8_t buffer[meshtastic_MeshPacket_size];
         size_t encodedLength = pb_encode_to_bytes(buffer, sizeof(buffer), &meshtastic_MeshPacket_msg, mp);
-        return udp.writeTo(buffer, encodedLength, udpIpAddress, UDP_MULTICAST_DEFAUL_PORT);
+        bool sent = udp.writeTo(buffer, encodedLength, udpIpAddress, UDP_MULTICAST_DEFAUL_PORT);
+#if HAS_UDP_UNICAST_PEERS
+        sendToPeers(mp, buffer, encodedLength);
+#endif
+        return sent;
     }
 
   private:
+#if HAS_UDP_UNICAST_PEERS
+    void sendToPeers(const meshtastic_MeshPacket *mp, const uint8_t *buffer, size_t len)
+    {
+        udppeers::PeerList peers;
+        bool have = udppeers::get(peers);
+        char why[96];
+        udppeers::diag(why, sizeof(why));
+        uint32_t sig = have ? peers.port : 0;
+        for (uint8_t i = 0; i < peers.count; i++)
+            sig = sig * 31 + peers.addr[i];
+        for (const char *c = why; *c; c++)
+            sig = sig * 31 + *c;
+        if (sig != peersSig) {
+            peersSig = sig;
+            LOG_INFO("UDP unicast peers (port %u): %u (%s)", peers.port, peers.count, why);
+            for (uint8_t i = 0; i < peers.count; i++)
+                LOG_INFO("  peer %s", IPAddress(peers.addr[i]).toString().c_str());
+        }
+        uint32_t skip = udppeers::sourceOf(mp->from, mp->id);
+        for (uint8_t i = 0; i < peers.count; i++) {
+            if (peers.addr[i] == skip)
+                continue;
+            if (!udp.writeTo(buffer, len, IPAddress(peers.addr[i]), peers.port))
+                LOG_WARN("UDP unicast to %s failed", IPAddress(peers.addr[i]).toString().c_str());
+        }
+    }
+    uint32_t peersSig = 0;
+#endif
     IPAddress udpIpAddress;
     AsyncUDP udp;
     bool isRunning;
