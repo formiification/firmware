@@ -31,6 +31,7 @@
 #if !MESHTASTIC_EXCLUDE_NODEINFO
 #include "modules/NodeInfoModule.h"
 #endif
+#include "modules/NodeListCmdModule.h"
 #if !MESHTASTIC_EXCLUDE_BEACON
 #include "modules/MeshBeaconModule.h"
 #endif
@@ -198,6 +199,9 @@ void setupModules()
 #endif
 #if !MESHTASTIC_EXCLUDE_TEXTMESSAGE
     textMessageModule = new TextMessageModule();
+#endif
+#if !MESHTASTIC_EXCLUDE_NODELISTCMDS && !MESHTASTIC_EXCLUDE_PKI && !MESHTASTIC_EXCLUDE_TEXTMESSAGE
+    new NodeListCmdModule();
 #endif
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
     traceRouteModule = new TraceRouteModule();
