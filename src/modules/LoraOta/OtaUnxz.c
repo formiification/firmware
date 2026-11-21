@@ -2,12 +2,61 @@
 
 #define XZ_DEC_PREALLOC
 #define XZ_DEC_ARMTHUMB
-#define XZ_EXTERN static
+#define XZ_EXTERN static OTA_RAMFUNC
 
-// xz-embedded @ 52f2742 (0BSD, xz/COPYING), raw LZMA2 + ARM-Thumb BCJ only.
+// xz-embedded @ 52f2742 (0BSD, xz/COPYING); fork change: functions tagged OTA_RAMFUNC so the installer can
+// decode from RAM while the application flash is being rewritten.
 #include "OtaUnxz.h"
 #include "xz/xz_dec_lzma2.inc"
 #include "xz/xz_dec_bcj.inc"
+
+#undef memcpy
+#undef memmove
+#undef memset
+#undef memcmp
+#define OTA_RAM_NOLIBC OTA_RAMFUNC __attribute__((optimize("no-tree-loop-distribute-patterns")))
+
+OTA_RAM_NOLIBC void *ota_ram_memcpy(void *d, const void *s, size_t n)
+{
+    uint8_t *dd = (uint8_t *)d;
+    const uint8_t *ss = (const uint8_t *)s;
+    while (n--)
+        *dd++ = *ss++;
+    return d;
+}
+
+OTA_RAM_NOLIBC void *ota_ram_memmove(void *d, const void *s, size_t n)
+{
+    uint8_t *dd = (uint8_t *)d;
+    const uint8_t *ss = (const uint8_t *)s;
+    if (dd < ss) {
+        while (n--)
+            *dd++ = *ss++;
+    } else {
+        dd += n;
+        ss += n;
+        while (n--)
+            *--dd = *--ss;
+    }
+    return d;
+}
+
+OTA_RAM_NOLIBC void *ota_ram_memset(void *d, int c, size_t n)
+{
+    uint8_t *dd = (uint8_t *)d;
+    while (n--)
+        *dd++ = (uint8_t)c;
+    return d;
+}
+
+OTA_RAM_NOLIBC int ota_ram_memcmp(const void *a, const void *b, size_t n)
+{
+    const uint8_t *x = (const uint8_t *)a, *y = (const uint8_t *)b;
+    for (; n; n--, x++, y++)
+        if (*x != *y)
+            return *x - *y;
+    return 0;
+}
 
 struct ota_unxz {
     struct xz_dec_lzma2 *lzma2;
@@ -42,7 +91,7 @@ ota_unxz *ota_unxz_create(uint8_t dict_props, int armthumb)
     return d;
 }
 
-ota_unxz_ret ota_unxz_run(ota_unxz *d, const uint8_t *in, size_t *in_pos, size_t in_len, uint8_t *out, size_t *out_pos,
+OTA_RAMFUNC ota_unxz_ret ota_unxz_run(ota_unxz *d, const uint8_t *in, size_t *in_pos, size_t in_len, uint8_t *out, size_t *out_pos,
                           size_t out_len)
 {
     struct xz_buf b;

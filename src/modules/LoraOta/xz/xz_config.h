@@ -37,6 +37,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Fork: the whole decoder runs from RAM so the installer can use it while it erases the application flash.
+ * OTA_RAMFUNC places a function in .data (copied to RAM at startup); libc calls are redirected to RAM copies. */
+#ifndef OTA_RAMFUNC
+#  if defined(OTA_HOST_EMU) || !defined(__arm__)
+#    define OTA_RAMFUNC
+#  else
+#    define OTA_RAMFUNC __attribute__((section(".data.ota_ramfunc")))
+#  endif
+#endif
+void *ota_ram_memcpy(void *d, const void *s, size_t n);
+void *ota_ram_memmove(void *d, const void *s, size_t n);
+void *ota_ram_memset(void *d, int c, size_t n);
+int ota_ram_memcmp(const void *a, const void *b, size_t n);
+#include <stddef.h>
+#define memcpy ota_ram_memcpy
+#define memmove ota_ram_memmove
+#define memset ota_ram_memset
+#define memcmp ota_ram_memcmp
 #include "xz.h"
 
 

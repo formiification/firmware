@@ -16,6 +16,7 @@
 enum class LoraOtaExtFrame : uint8_t {
     Query = 12,      // any -> node: reply with Status
     Status = 13,     // node -> asker
+    Activate = 14,   // admin -> node: install the Ready staged image (payload: sha256 + XEdDSA signature)
     SeedTo = 15,     // admin (PKI) -> node: seed the staged image to a 0-hop neighbour
     SeedReport = 16, // node -> admin: progress of that relay session
 };
@@ -46,7 +47,7 @@ class LoraOtaModule : public SinglePortModule, private concurrency::OSThread, pr
     int32_t runOnce() override;
 
   private:
-    enum class Phase : uint8_t { Idle = 0, Receiving = 1, Verifying = 2, Ready = 3, Failed = 4 };
+    enum class Phase : uint8_t { Idle = 0, Receiving = 1, Verifying = 2, Ready = 3, Failed = 4, Installing = 5 };
 
     struct Relay {
         NodeNum target = 0;
@@ -83,6 +84,7 @@ class LoraOtaModule : public SinglePortModule, private concurrency::OSThread, pr
     bool isAdminCommand(const meshtastic_MeshPacket &mp) const;
 
     void handleSeedTo(const meshtastic_MeshPacket &mp, const uint8_t *p, size_t n);
+    void handleActivate(const meshtastic_MeshPacket &mp, const uint8_t *p, size_t n);
     void relayFrame(const ota_common::OtaFrameHeader &h, const uint8_t *p, size_t n);
     void relaySendUnit(uint8_t type, uint16_t index, const uint8_t *data, size_t len);
     void relayTick();

@@ -27,6 +27,7 @@ enum class StagingState : uint32_t {
     Received = 2, // all blocks merkle-verified and stored
     Ready = 3,    // decompressed image matches output_sha256
     Failed = 4,
+    Installed = 5, // written over the application by OtaInstall; still seedable
 };
 
 enum class Reject : uint8_t {
@@ -64,7 +65,7 @@ class OtaStaging final : public ota_common::IBlockStore
     void setSignature(const uint8_t *sig);
     bool seedable() const
     {
-        return meta_.magic == META_MAGIC && (meta_.state == StagingState::Ready);
+        return meta_.magic == META_MAGIC && (meta_.state == StagingState::Ready || meta_.state == StagingState::Installed);
     }
     bool hasManifest() const { return meta_.magic == META_MAGIC; }
     uint32_t stagingStart() const { return OTA_META_ADDR - alignUp(meta_.manifest.payload_length); }
@@ -89,6 +90,11 @@ class OtaStaging final : public ota_common::IBlockStore
         uint32_t crc;
     };
 
+  public:
+    static constexpr size_t META_STATE_OFFSET = 8; // Meta::state, checked below
+    static constexpr size_t META_CRC_OFFSET = 16 + sizeof(ota_common::Manifest) + 64;
+
+  private:
     bool ensureBound() const;
     void writeMeta();
     static uint32_t crc32(const uint8_t *p, size_t n);
@@ -99,6 +105,8 @@ class OtaStaging final : public ota_common::IBlockStore
     mutable Reject reject_ = Reject::None;
     mutable bool metaDirty_ = false;
     mutable Meta meta_{};
+    static_assert(offsetof(Meta, state) == META_STATE_OFFSET, "OtaInstall patches Meta::state in place");
+    static_assert(offsetof(Meta, crc) == META_CRC_OFFSET, "OtaInstall recomputes Meta::crc in place");
 };
 
 } // namespace lora_ota

@@ -4,7 +4,10 @@
 
 #include "MeshService.h"
 #include "NodeDB.h"
+#include "OtaInstall.h"
 #include "OtaUnxz.h"
+#include "UptimeClock.h"
+#include "main.h"
 #include "airtime.h"
 #include "mesh/Throttle.h"
 #include "ota_common/sha256.h"
@@ -29,6 +32,8 @@ constexpr size_t FRAGMENT = 200; // leaves room for PKI overhead under the 233-b
 constexpr uint32_t RELAY_START_RETRY_MS = 60 * 1000;
 constexpr uint32_t RELAY_SILENCE_MS = 15 * 60 * 1000;
 constexpr uint32_t RELAY_VERIFY_WAIT_MS = 5 * 60 * 1000;
+constexpr uint32_t INSTALL_REBOOT_DELAY_MS = 3000; // lets the Installing status leave the radio
+const char ACTIVATE_TAG[] = "LOTA-ACTIVATE";
 
 void putLe16(uint8_t *p, uint16_t v)
 {
@@ -240,6 +245,10 @@ ProcessMessage LoraOtaModule::handleReceived(const meshtastic_MeshPacket &mp)
         handleSeedTo(mp, body, bodyLen);
         return ProcessMessage::STOP;
     }
+    if (type == static_cast<uint8_t>(LoraOtaExtFrame::Activate)) {
+        handleActivate(mp, body, bodyLen);
+        return ProcessMessage::STOP;
+    }
     if (relayActive() && mp.from == relay.target) {
         relayFrame(h, body, bodyLen);
         return ProcessMessage::STOP;
@@ -269,6 +278,32 @@ ProcessMessage LoraOtaModule::handleReceived(const meshtastic_MeshPacket &mp)
     rx->on_frame(data, len);
     afterFrame();
     return ProcessMessage::STOP;
+}
+
+void LoraOtaModule::handleActivate(const meshtastic_MeshPacket &mp, const uint8_t *p, size_t n)
+{
+    const ota_common::Manifest &m = staging.manifest();
+    bool ready = phase != Phase::Installing && !rx && !relayActive() && staging.state() == StagingState::Ready;
+    bool imageMatches = n >= 32 && staging.hasManifest() && memcmp(p, m.output_sha256, 32) == 0;
+    bool authorized = isAdminCommand(mp);
+    if (!authorized && n >= 32 + 64) {
+        uint8_t msg[sizeof(ACTIVATE_TAG) - 1 + 32];
+        memcpy(msg, ACTIVATE_TAG, sizeof(ACTIVATE_TAG) - 1);
+        memcpy(msg + sizeof(ACTIVATE_TAG) - 1, p, 32);
+        loadAdminKeys();
+        authorized = verifier.verify(msg, sizeof(msg), p + 32, 64);
+    }
+    if (!ready || !imageMatches || !authorized) {
+        LOG_WARN("LoRa OTA: Activate from 0x%08x refused (ready=%d image=%d auth=%d)", mp.from, ready, imageMatches, authorized);
+        sendStatus(mp.from, mp.channel);
+        return;
+    }
+    LOG_INFO("LoRa OTA: installing staged image on reboot (requested by 0x%08x)", mp.from);
+    staging.flush();
+    phase = Phase::Installing;
+    sendStatus(mp.from, mp.channel);
+    requestInstall();
+    rebootAtMsec = Time::timerEndsAtMillis(INSTALL_REBOOT_DELAY_MS);
 }
 
 bool LoraOtaModule::relayActive() const

@@ -83,12 +83,12 @@ struct xz_dec_bcj {
  * This is used to test the most significant byte of a memory address
  * in an x86 instruction.
  */
-static inline int bcj_x86_test_msbyte(uint8_t b)
+static inline OTA_RAMFUNC int bcj_x86_test_msbyte(uint8_t b)
 {
 	return b == 0x00 || b == 0xFF;
 }
 
-static size_t bcj_x86(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
+static OTA_RAMFUNC size_t bcj_x86(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 {
 	static const bool mask_to_allowed_status[8]
 		= { true, true, true, false, true, false, false, false };
@@ -160,7 +160,7 @@ static size_t bcj_x86(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 #endif
 
 #ifdef XZ_DEC_POWERPC
-static size_t bcj_powerpc(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
+static OTA_RAMFUNC size_t bcj_powerpc(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 {
 	size_t i;
 	uint32_t instr;
@@ -183,7 +183,7 @@ static size_t bcj_powerpc(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 #endif
 
 #ifdef XZ_DEC_IA64
-static size_t bcj_ia64(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
+static OTA_RAMFUNC size_t bcj_ia64(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 {
 	static const uint8_t branch_table[32] = {
 		0, 0, 0, 0, 0, 0, 0, 0,
@@ -269,7 +269,7 @@ static size_t bcj_ia64(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 #endif
 
 #ifdef XZ_DEC_ARM
-static size_t bcj_arm(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
+static OTA_RAMFUNC size_t bcj_arm(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 {
 	size_t i;
 	uint32_t addr;
@@ -294,7 +294,7 @@ static size_t bcj_arm(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 #endif
 
 #ifdef XZ_DEC_ARMTHUMB
-static size_t bcj_armthumb(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
+static OTA_RAMFUNC size_t bcj_armthumb(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 {
 	size_t i;
 	uint32_t addr;
@@ -327,7 +327,7 @@ static size_t bcj_armthumb(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 #endif
 
 #ifdef XZ_DEC_SPARC
-static size_t bcj_sparc(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
+static OTA_RAMFUNC size_t bcj_sparc(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 {
 	size_t i;
 	uint32_t instr;
@@ -351,7 +351,7 @@ static size_t bcj_sparc(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 #endif
 
 #ifdef XZ_DEC_ARM64
-static size_t bcj_arm64(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
+static OTA_RAMFUNC size_t bcj_arm64(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 {
 	size_t i;
 	uint32_t instr;
@@ -392,7 +392,7 @@ static size_t bcj_arm64(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 #endif
 
 #ifdef XZ_DEC_RISCV
-static size_t bcj_riscv(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
+static OTA_RAMFUNC size_t bcj_riscv(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
 {
 	size_t i;
 	uint32_t b1;
@@ -492,7 +492,7 @@ static size_t bcj_riscv(struct xz_dec_bcj *s, uint8_t *buf, size_t size)
  * pointers, which could be problematic in the kernel boot code, which must
  * avoid pointers to static data (at least on x86).
  */
-static void bcj_apply(struct xz_dec_bcj *s,
+static OTA_RAMFUNC void bcj_apply(struct xz_dec_bcj *s,
 		      uint8_t *buf, size_t *pos, size_t size)
 {
 	size_t filtered;
@@ -556,7 +556,7 @@ static void bcj_apply(struct xz_dec_bcj *s,
  * Move the remaining mixture of possibly filtered and unfiltered
  * data to the beginning of temp.
  */
-static void bcj_flush(struct xz_dec_bcj *s, struct xz_buf *b)
+static OTA_RAMFUNC void bcj_flush(struct xz_dec_bcj *s, struct xz_buf *b)
 {
 	size_t copy_size;
 
