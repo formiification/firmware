@@ -162,6 +162,14 @@ void OtaStaging::setState(StagingState s)
     writeMeta();
 }
 
+void OtaStaging::setSignature(const uint8_t *sig)
+{
+    if (meta_.magic != META_MAGIC || memcmp(meta_.signature, sig, sizeof(meta_.signature)) == 0)
+        return;
+    memcpy(meta_.signature, sig, sizeof(meta_.signature));
+    metaDirty_ = true;
+}
+
 void OtaStaging::flush()
 {
     FlashLock lock;

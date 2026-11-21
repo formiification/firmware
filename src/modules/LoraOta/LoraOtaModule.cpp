@@ -5,6 +5,7 @@
 #include "MeshService.h"
 #include "NodeDB.h"
 #include "OtaUnxz.h"
+#include "airtime.h"
 #include "mesh/Throttle.h"
 #include "ota_common/sha256.h"
 #include <algorithm>
@@ -24,6 +25,10 @@ constexpr uint32_t GAP_INITIAL_MS = 2000;
 constexpr uint32_t SESSION_IDLE_MS = 10 * 60 * 1000;
 constexpr size_t VERIFY_IN_STEP = 8 * 1024;
 constexpr uint8_t STATUS_VERSION = 1;
+constexpr size_t FRAGMENT = 200; // leaves room for PKI overhead under the 233-byte payload cap
+constexpr uint32_t RELAY_START_RETRY_MS = 60 * 1000;
+constexpr uint32_t RELAY_SILENCE_MS = 15 * 60 * 1000;
+constexpr uint32_t RELAY_VERIFY_WAIT_MS = 5 * 60 * 1000;
 
 void putLe16(uint8_t *p, uint16_t v)
 {
@@ -137,7 +142,9 @@ void LoraOtaModule::sendStatus(NodeNum to, uint8_t channel)
     loadAdminKeys(); // keys may have changed via admin since boot
     p[16] = verifier.key_count();
     p[17] = config.security.admin_key_count;
-    // p[18..23]: reserved
+    p[18] = static_cast<uint8_t>(relay.state);
+    p[19] = relay.targetPhase;
+    putLe32(p + 20, relay.target);
     if (staging.hasManifest())
         memcpy(p + 24, m.output_sha256, 8);
     strncpy(reinterpret_cast<char *>(p + 32), optstr(APP_ENV), 32);
@@ -170,8 +177,25 @@ void LoraOtaModule::endSession()
         phase = Phase::Idle;
 }
 
+void LoraOtaModule::captureManifest(const OtaFrameHeader &h, const uint8_t *p, size_t n)
+{
+    // OtaReceiver keeps only the manifest; the signature is needed to re-seed this image later.
+    if (h.total != sizeof(manifestBuf) || h.off != manifestFill || h.off + n > sizeof(manifestBuf)) {
+        if (h.off == 0 && h.total == sizeof(manifestBuf) && n <= sizeof(manifestBuf)) {
+            manifestFill = 0;
+        } else {
+            return;
+        }
+    }
+    memcpy(manifestBuf + manifestFill, p, n);
+    manifestFill += n;
+}
+
 void LoraOtaModule::afterFrame()
 {
+    if (rx->manifest_ready() && manifestFill == sizeof(manifestBuf) &&
+        memcmp(manifestBuf, &rx->manifest(), sizeof(ota_common::Manifest)) == 0)
+        staging.setSignature(manifestBuf + sizeof(ota_common::Manifest));
     if (staging.rejected() != Reject::None) {
         lastReject = static_cast<uint8_t>(staging.rejected());
         LOG_WARN("LoRa OTA: manifest rejected (%u)", lastReject);
@@ -212,15 +236,25 @@ ProcessMessage LoraOtaModule::handleReceived(const meshtastic_MeshPacket &mp)
         sendStatus(mp.from, mp.channel);
         return ProcessMessage::STOP;
     }
+    if (type == static_cast<uint8_t>(LoraOtaExtFrame::SeedTo)) {
+        handleSeedTo(mp, body, bodyLen);
+        return ProcessMessage::STOP;
+    }
+    if (relayActive() && mp.from == relay.target) {
+        relayFrame(h, body, bodyLen);
+        return ProcessMessage::STOP;
+    }
 
     bool sessionLive = rx && Throttle::isWithinTimespanMs(lastFrameMs, SESSION_IDLE_MS);
     if (h.type == OtaFrameType::Start) {
-        if (phase == Phase::Verifying)
+        if (phase == Phase::Verifying || relayActive())
             return ProcessMessage::STOP; // the staged image is in use
         if (sessionLive && mp.from != seeder)
             return ProcessMessage::STOP; // busy with another seeder
-        if (!rx || mp.from != seeder || h.session != sessionId)
+        if (!rx || mp.from != seeder || h.session != sessionId) {
             startSession(mp, h.session);
+            manifestFill = 0;
+        }
     }
     if (!rx || mp.from != seeder)
         return ProcessMessage::STOP;
@@ -230,9 +264,228 @@ ProcessMessage LoraOtaModule::handleReceived(const meshtastic_MeshPacket &mp)
     if (gap < POLL_MAX_MS) // learn the seeder's frame pacing; a lost fragment is re-requested after a few gaps
         frameGapMs = (frameGapMs * 4 + gap) / 5;
     lastFrameMs = lastPollMs = now;
+    if (h.type == OtaFrameType::Manifest)
+        captureManifest(h, body, bodyLen);
     rx->on_frame(data, len);
     afterFrame();
     return ProcessMessage::STOP;
+}
+
+bool LoraOtaModule::relayActive() const
+{
+    return relay.state == RelayState::Starting || relay.state == RelayState::Transferring ||
+           relay.state == RelayState::Done;
+}
+
+void LoraOtaModule::handleSeedTo(const meshtastic_MeshPacket &mp, const uint8_t *p, size_t n)
+{
+    NodeNum target = n >= 4 ? (NodeNum)p[0] | (NodeNum)p[1] << 8 | (NodeNum)p[2] << 16 | (NodeNum)p[3] << 24 : 0;
+    uint8_t channel = n >= 5 ? p[4] : 0;
+    RelayState refusal = RelayState::Idle;
+    if (!isAdminCommand(mp))
+        refusal = RelayState::Denied;
+    else if (target == 0) {
+        if (relayActive())
+            relayFinish(RelayState::Cancelled);
+        return;
+    } else if (relayActive() && target == relay.target) {
+        relay.commander = mp.from;
+        relay.commanderChannel = mp.channel;
+        relayReport(true);
+        return;
+    } else if (relayActive() || rx || phase == Phase::Verifying)
+        refusal = RelayState::Busy;
+    else if (!staging.seedable() || target == nodeDB->getNodeNum())
+        refusal = RelayState::NoImage;
+    if (refusal != RelayState::Idle) {
+        LOG_WARN("LoRa OTA: SeedTo 0x%08x from 0x%08x refused (%u)", target, mp.from, (unsigned)refusal);
+        sendSeedReport(mp.from, mp.channel, target, refusal, 0xFF, 0, 0, 0, 0);
+        return;
+    }
+    relay.commander = mp.from;
+    relay.commanderChannel = mp.channel;
+    const ota_common::Manifest &m = staging.manifest();
+    relay.target = target;
+    relay.channel = channel;
+    relay.session = (uint8_t)random(1, 256);
+    relay.leaves.clear();
+    relay.leaves.reserve(m.block_count);
+    const uint8_t *payload = reinterpret_cast<const uint8_t *>(staging.stagingStart());
+    for (uint32_t off = 0; off < m.payload_length; off += m.block_size) {
+        uint32_t blen = off + m.block_size <= m.payload_length ? m.block_size : m.payload_length - off;
+        relay.leaves.push_back(ota_common::hash_leaf(payload + off, blen));
+    }
+    relay.acked.assign(m.block_count, false);
+    relay.ackedCount = 0;
+    relay.targetPhase = 0xFF;
+    relay.targetReject = 0;
+    relay.lastReportDecile = 0;
+    relay.state = RelayState::Starting;
+    relay.startedMs = relay.lastRxMs = millis();
+    relay.lastStartMs = 0;
+    relay.doneMs = 0;
+    LOG_INFO("LoRa OTA: seeding staged image to 0x%08x for 0x%08x", target, mp.from);
+    relayReport(true);
+    setIntervalFromNow(0);
+}
+
+void LoraOtaModule::relaySendUnit(uint8_t type, uint16_t index, const uint8_t *data, size_t len)
+{
+    uint8_t f[ota_common::kFrameHeaderLen + FRAGMENT];
+    if (len == 0) {
+        sendSimple(relay.target, relay.channel, type, relay.session, index, true);
+        return;
+    }
+    for (size_t off = 0; off < len; off += FRAGMENT) {
+        size_t n = len - off < FRAGMENT ? len - off : FRAGMENT;
+        OtaFrameHeader h{static_cast<OtaFrameType>(type), relay.session, index, (uint16_t)off, (uint16_t)len};
+        ota_common::frame_header_pack(h, f);
+        memcpy(f + ota_common::kFrameHeaderLen, data + off, n);
+        sendTo(relay.target, relay.channel, f, ota_common::kFrameHeaderLen + n, true);
+    }
+}
+
+void LoraOtaModule::relayFrame(const OtaFrameHeader &h, const uint8_t *p, size_t n)
+{
+    uint8_t type = static_cast<uint8_t>(h.type);
+    if (type == static_cast<uint8_t>(LoraOtaExtFrame::Status)) {
+        if (n >= 4) {
+            relay.targetPhase = p[1];
+            relay.targetReject = p[3];
+            if (relay.state == RelayState::Done && (p[1] == 3 || p[1] == 4))
+                relayFinish(p[1] == 3 ? RelayState::Verified : RelayState::Failed);
+        }
+        return;
+    }
+    if (h.session != relay.session)
+        return;
+    relay.lastRxMs = millis();
+    const ota_common::Manifest &m = staging.manifest();
+    switch (h.type) {
+    case OtaFrameType::Request:
+        if (relay.state == RelayState::Starting)
+            relay.state = RelayState::Transferring;
+        if (!airTime->isTxAllowedAirUtil()) {
+            LOG_DEBUG("LoRa OTA: relay paused, airtime budget used"); // the target re-requests after its poll
+            return;
+        }
+        if (h.index == ota_common::kIndexManifest) {
+            uint8_t unit[sizeof(ota_common::Manifest) + 64];
+            memcpy(unit, &m, sizeof(m));
+            memcpy(unit + sizeof(m), staging.signature(), 64);
+            relaySendUnit(static_cast<uint8_t>(OtaFrameType::Manifest), h.index, unit, sizeof(unit));
+        } else if (h.index < m.block_count) {
+            std::vector<ota_common::Hash256> proof = ota_common::merkle_proof(relay.leaves, h.index);
+            relaySendUnit(static_cast<uint8_t>(OtaFrameType::Proof), h.index, reinterpret_cast<const uint8_t *>(proof.data()),
+                          proof.size() * sizeof(ota_common::Hash256));
+            uint32_t off = (uint32_t)h.index * m.block_size;
+            uint32_t blen = off + m.block_size <= m.payload_length ? m.block_size : m.payload_length - off;
+            relaySendUnit(static_cast<uint8_t>(OtaFrameType::Block), h.index,
+                          reinterpret_cast<const uint8_t *>(staging.stagingStart()) + off, blen);
+        }
+        break;
+    case OtaFrameType::Ack:
+        if (h.index < relay.acked.size() && !relay.acked[h.index]) {
+            relay.acked[h.index] = true;
+            relay.ackedCount++;
+            relayReport(false);
+        }
+        break;
+    case OtaFrameType::Done:
+        relay.ackedCount = m.block_count;
+        relay.state = RelayState::Done;
+        relay.doneMs = millis();
+        relayReport(true);
+        break;
+    case OtaFrameType::Abort:
+        relayFinish(RelayState::Aborted);
+        break;
+    default:
+        break;
+    }
+}
+
+void LoraOtaModule::relayTick()
+{
+    if (!relayActive())
+        return;
+    if (!airTime->isTxAllowedAirUtil()) {
+        relay.lastRxMs = millis(); // our own pause: do not count it as target silence
+        return;
+    }
+    if (relay.state == RelayState::Transferring && Throttle::hasElapsed(relay.lastRxMs, 60 * 1000) &&
+        Throttle::hasElapsed(relay.lastStartMs, 60 * 1000)) {
+        relay.state = RelayState::Starting; // target may have closed its idle session: re-kick, it resumes from flash
+    }
+    if (relay.state == RelayState::Starting && (relay.lastStartMs == 0 || Throttle::hasElapsed(relay.lastStartMs, RELAY_START_RETRY_MS))) {
+        const ota_common::Manifest &m = staging.manifest();
+        uint8_t f[ota_common::kFrameHeaderLen + 12];
+        OtaFrameHeader h{OtaFrameType::Start, relay.session, 0, 0, 0};
+        ota_common::frame_header_pack(h, f);
+        uint8_t *b = f + ota_common::kFrameHeaderLen;
+        putLe16(b, m.block_size);
+        putLe16(b + 2, m.block_count);
+        putLe32(b + 4, m.payload_length);
+        putLe16(b + 8, sizeof(ota_common::Manifest));
+        putLe16(b + 10, 64);
+        sendTo(relay.target, relay.channel, f, sizeof(f), true);
+        relay.lastStartMs = millis();
+    }
+    if (relay.state == RelayState::Done) {
+        if (Throttle::hasElapsed(relay.doneMs, RELAY_VERIFY_WAIT_MS))
+            return relayFinish(RelayState::Done); // verified state unknown; the panel can query the target
+        if (Throttle::hasElapsed(relay.doneMs, 30 * 1000) &&
+            (relay.lastQueryMs == 0 || Throttle::hasElapsed(relay.lastQueryMs, 60 * 1000))) {
+            sendSimple(relay.target, relay.channel, static_cast<uint8_t>(LoraOtaExtFrame::Query), relay.session, 0, true);
+            relay.lastQueryMs = millis();
+        }
+        return;
+    }
+    if (Throttle::hasElapsed(relay.lastRxMs, RELAY_SILENCE_MS))
+        relayFinish(RelayState::Timeout);
+}
+
+void LoraOtaModule::relayFinish(RelayState s)
+{
+    if (s == RelayState::Cancelled || s == RelayState::Timeout)
+        sendSimple(relay.target, relay.channel, static_cast<uint8_t>(OtaFrameType::Abort), relay.session, 0, true);
+    relay.state = s;
+    relay.leaves.clear();
+    relay.leaves.shrink_to_fit();
+    relay.acked.clear();
+    relay.acked.shrink_to_fit();
+    LOG_INFO("LoRa OTA: relay to 0x%08x finished (%u)", relay.target, (unsigned)s);
+    relayReport(true);
+}
+
+void LoraOtaModule::sendSeedReport(NodeNum to, uint8_t channel, NodeNum target, RelayState state, uint8_t targetPhase,
+                                   uint16_t acked, uint16_t total, uint8_t reject, uint8_t session)
+{
+    uint8_t f[ota_common::kFrameHeaderLen + 12];
+    OtaFrameHeader h{static_cast<OtaFrameType>(LoraOtaExtFrame::SeedReport), session, 0, 0, 0};
+    ota_common::frame_header_pack(h, f);
+    uint8_t *b = f + ota_common::kFrameHeaderLen;
+    putLe32(b, target);
+    b[4] = static_cast<uint8_t>(state);
+    b[5] = targetPhase;
+    putLe16(b + 6, acked);
+    putLe16(b + 8, total);
+    b[10] = reject;
+    b[11] = 0;
+    sendTo(to, channel, f, sizeof(f), false);
+}
+
+void LoraOtaModule::relayReport(bool force)
+{
+    if (!relay.commander)
+        return;
+    const uint16_t total = staging.hasManifest() ? staging.manifest().block_count : 0;
+    uint8_t decile = total ? (uint8_t)(relay.ackedCount * 10 / total) : 0;
+    if (!force && decile == relay.lastReportDecile)
+        return; // at most ~10 progress reports per session over the multi-hop path
+    relay.lastReportDecile = decile;
+    sendSeedReport(relay.commander, relay.commanderChannel, relay.target, relay.state, relay.targetPhase, relay.ackedCount,
+                   total, relay.targetReject, relay.session);
 }
 
 bool LoraOtaModule::consumeOutput(Verify &v, const ota_common::Manifest &m, size_t n)
@@ -311,6 +564,7 @@ int32_t LoraOtaModule::runOnce()
         }
         return phase == Phase::Verifying ? 0 : 1000;
     }
+    relayTick();
     if (rx) {
         if (Throttle::hasElapsed(lastFrameMs, SESSION_IDLE_MS)) {
             LOG_INFO("LoRa OTA: session idle, progress kept (%u/%u)", (unsigned)rx->blocks_have(),

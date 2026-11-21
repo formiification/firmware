@@ -60,6 +60,12 @@ class OtaStaging final : public ota_common::IBlockStore
     Reject rejected() const { return reject_; }
     StagingState state() const { return meta_.state; }
     const ota_common::Manifest &manifest() const { return meta_.manifest; }
+    const uint8_t *signature() const { return meta_.signature; }
+    void setSignature(const uint8_t *sig);
+    bool seedable() const
+    {
+        return meta_.magic == META_MAGIC && (meta_.state == StagingState::Ready);
+    }
     bool hasManifest() const { return meta_.magic == META_MAGIC; }
     uint32_t stagingStart() const { return OTA_META_ADDR - alignUp(meta_.manifest.payload_length); }
 
@@ -70,7 +76,7 @@ class OtaStaging final : public ota_common::IBlockStore
 
   private:
     static constexpr uint32_t META_MAGIC = 0x4D544F4C; // "LOTM"
-    static constexpr uint32_t META_VERSION = 1;
+    static constexpr uint32_t META_VERSION = 2;
     static constexpr uint32_t FLUSH_EVERY = 16;
 
     struct Meta {
@@ -79,6 +85,7 @@ class OtaStaging final : public ota_common::IBlockStore
         StagingState state;
         uint32_t done; // contiguous blocks stored from 0
         ota_common::Manifest manifest;
+        uint8_t signature[64]; // kept so this node can re-seed the image to its neighbours
         uint32_t crc;
     };
 
