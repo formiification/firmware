@@ -39,10 +39,12 @@ constexpr uint32_t RELAY_START_RETRY_MS = 60 * 1000;
 constexpr uint32_t RELAY_SILENCE_MS = 15 * 60 * 1000;
 constexpr uint32_t RELAY_VERIFY_WAIT_MS = 5 * 60 * 1000;
 constexpr uint32_t KEY_REQUEST_INTERVAL_MS = 60 * 1000;
-// A relay paces its frames to this share of airtime, under the firmware's polite limit (half the region's
-// duty cycle, 5 % in EU868): unpaced it answers every request at once and then stalls for most of an hour.
-constexpr uint32_t RELAY_DUTY_PERCENT = 4;
 constexpr uint32_t PACKET_OVERHEAD = 16 + 12 + 6; // header, PKI tag/nonce, Data protobuf around our payload
+// Share of airtime a transfer may take, set by the seeder in Start (byte 12, permille) and enforced by the
+// receiver; capped under the firmware's polite limit (half the EU868 duty cycle) so a relay never stalls on it.
+constexpr uint16_t RX_DUTY_DEFAULT_PERMILLE = 35, RX_DUTY_MIN_PERMILLE = 5, RX_DUTY_MAX_PERMILLE = 45;
+constexpr uint8_t RELAY_DUTY_PERMILLE = 35;
+constexpr uint32_t POLL_BACKOFF_MAX_MS = 60 * 1000;
 constexpr uint32_t INSTALL_REBOOT_DELAY_MS = 3000; // lets the Installing status leave the radio
 const char ACTIVATE_TAG[] = "LOTA-ACTIVATE";
 
@@ -123,9 +125,40 @@ void LoraOtaModule::sendSimple(NodeNum to, uint8_t channel, uint8_t type, uint8_
     sendTo(to, channel, f, sizeof(f), zeroHop);
 }
 
-void LoraOtaModule::send_frame(const uint8_t *data, size_t len)
+uint32_t LoraOtaModule::frameAirMs(size_t len)
+{
+    return RadioLibInterface::instance ? RadioLibInterface::instance->getPacketTime(len + PACKET_OVERHEAD) : 0;
+}
+
+uint32_t LoraOtaModule::requestWaitMs() const
+{
+    uint32_t need = reqAirMs * 1000 / rxDutyPermille, since = millis() - reqFromMs;
+    return reqFromMs && since < need ? need - since : 0;
+}
+
+void LoraOtaModule::sendRequestNow(const uint8_t *data, size_t len)
 {
     sendTo(seeder, seederChannel, data, len, true);
+    reqFromMs = lastPollMs = millis();
+    reqAirMs = frameAirMs(len);
+    pendingReqLen = 0;
+}
+
+void LoraOtaModule::send_frame(const uint8_t *data, size_t len)
+{
+    if (len && data[0] == static_cast<uint8_t>(OtaFrameType::Request) && len <= sizeof(pendingReq)) {
+        uint32_t wait = requestWaitMs();
+        if (!wait) {
+            sendRequestNow(data, len);
+        } else { // the latest request wins; it goes out when the airtime share allows
+            memcpy(pendingReq, data, len);
+            pendingReqLen = len;
+            setIntervalFromNow(wait);
+        }
+        return;
+    }
+    sendTo(seeder, seederChannel, data, len, true);
+    reqAirMs += frameAirMs(len);
 }
 
 // Our replies are DMs, and the router refuses a DM to a node whose public key it lacks (only traceroute,
@@ -138,11 +171,13 @@ void LoraOtaModule::requestKey(NodeNum peer, uint8_t channel)
         return;
     if (peer == keyAsked && Throttle::isWithinTimespanMs(keyAskedMs, KEY_REQUEST_INTERVAL_MS))
         return;
-    keyAsked = peer;
-    keyAskedMs = millis();
     LOG_INFO("LoRa OTA: no public key for 0x%08x, requesting its NodeInfo", peer);
     // Short timeout: the routine path skips a NodeInfo sent in the last ~30 min, e.g. the one sent at boot.
-    nodeInfoModule->sendOurNodeInfo(peer, true, channel, true);
+    // Only a NodeInfo that went out starts the hold-off; a skipped one is retried on the peer's next frame.
+    if (nodeInfoModule->sendOurNodeInfo(peer, true, channel, true)) {
+        keyAsked = peer;
+        keyAskedMs = millis();
+    }
 #else
     (void)peer;
     (void)channel;
@@ -242,6 +277,10 @@ void LoraOtaModule::startSession(const meshtastic_MeshPacket &mp, uint8_t sessio
     sessionId = session;
     lastReject = 0;
     frameGapMs = GAP_INITIAL_MS;
+    rxDutyPermille = RX_DUTY_DEFAULT_PERMILLE; // the Start being handled may set it
+    reqFromMs = reqAirMs = 0;
+    pendingReqLen = 0;
+    unansweredPolls = 0;
     rx.reset(new ota_common::OtaReceiver(staging, *this, session, &verifier));
     staging.attach(rx.get());
     phase = Phase::Receiving;
@@ -354,6 +393,12 @@ ProcessMessage LoraOtaModule::handleReceived(const meshtastic_MeshPacket &mp)
     lastFrameMs = lastPollMs = now;
     if (h.type == OtaFrameType::Manifest)
         captureManifest(h, body, bodyLen);
+    if (h.type == OtaFrameType::Start) {
+        uint16_t d = bodyLen >= 13 ? body[12] : RX_DUTY_DEFAULT_PERMILLE;
+        rxDutyPermille = d < RX_DUTY_MIN_PERMILLE ? RX_DUTY_MIN_PERMILLE : d > RX_DUTY_MAX_PERMILLE ? RX_DUTY_MAX_PERMILLE : d;
+    }
+    reqAirMs += frameAirMs(len); // the seeder's airtime counts against our share
+    unansweredPolls = 0;
     rx->on_frame(data, len);
     afterFrame();
     return ProcessMessage::STOP;
@@ -436,7 +481,6 @@ void LoraOtaModule::handleSeedTo(const meshtastic_MeshPacket &mp, const uint8_t 
     relay.lastReportDecile = 0;
     relay.state = RelayState::Starting;
     relay.startedMs = relay.lastRxMs = millis();
-    relay.paceGapMs = 0;
     relay.lastStartMs = 0;
     relay.doneMs = 0;
     requestKey(target, channel); // relay frames to the target are DMs too
@@ -458,8 +502,6 @@ void LoraOtaModule::relaySendUnit(uint8_t type, uint16_t index, const uint8_t *d
         ota_common::frame_header_pack(h, f);
         memcpy(f + ota_common::kFrameHeaderLen, data + off, n);
         sendTo(relay.target, relay.channel, f, ota_common::kFrameHeaderLen + n, true);
-        if (RadioLibInterface::instance)
-            relay.unitAirMs += RadioLibInterface::instance->getPacketTime(ota_common::kFrameHeaderLen + n + PACKET_OVERHEAD);
     }
 }
 
@@ -487,9 +529,6 @@ void LoraOtaModule::relayFrame(const OtaFrameHeader &h, const uint8_t *p, size_t
             LOG_DEBUG("LoRa OTA: relay paused, airtime budget used"); // the target re-requests after its poll
             return;
         }
-        if (relay.paceGapMs && Throttle::isWithinTimespanMs(relay.paceFromMs, relay.paceGapMs))
-            return; // pacing: the target asks again after its poll interval
-        relay.unitAirMs = 0;
         if (h.index == ota_common::kIndexManifest) {
             uint8_t unit[sizeof(ota_common::Manifest) + 64];
             memcpy(unit, &m, sizeof(m));
@@ -504,8 +543,6 @@ void LoraOtaModule::relayFrame(const OtaFrameHeader &h, const uint8_t *p, size_t
             relaySendUnit(static_cast<uint8_t>(OtaFrameType::Block), h.index,
                           reinterpret_cast<const uint8_t *>(staging.stagingStart()) + off, blen);
         }
-        relay.paceFromMs = millis();
-        relay.paceGapMs = relay.unitAirMs * 100 / RELAY_DUTY_PERCENT;
         break;
     case OtaFrameType::Ack:
         if (h.index < relay.acked.size() && !relay.acked[h.index]) {
@@ -542,7 +579,8 @@ void LoraOtaModule::relayTick()
     }
     if (relay.state == RelayState::Starting && (relay.lastStartMs == 0 || Throttle::hasElapsed(relay.lastStartMs, RELAY_START_RETRY_MS))) {
         const ota_common::Manifest &m = staging.manifest();
-        uint8_t f[ota_common::kFrameHeaderLen + 12];
+        requestKey(relay.target, relay.channel); // the first request (at SeedTo) or its answer may be lost
+        uint8_t f[ota_common::kFrameHeaderLen + 13];
         OtaFrameHeader h{OtaFrameType::Start, relay.session, 0, 0, 0};
         ota_common::frame_header_pack(h, f);
         uint8_t *b = f + ota_common::kFrameHeaderLen;
@@ -551,6 +589,7 @@ void LoraOtaModule::relayTick()
         putLe32(b + 4, m.payload_length);
         putLe16(b + 8, sizeof(ota_common::Manifest));
         putLe16(b + 10, 64);
+        b[12] = RELAY_DUTY_PERMILLE; // the target paces its requests to this
         sendTo(relay.target, relay.channel, f, sizeof(f), true);
         relay.lastStartMs = millis();
     }
@@ -698,9 +737,17 @@ int32_t LoraOtaModule::runOnce()
             LOG_INFO("LoRa OTA: session idle, progress kept (%u/%u)", (unsigned)rx->blocks_have(),
                      (unsigned)rx->blocks_total());
             endSession();
-        } else if (Throttle::hasElapsed(lastPollMs, std::min(POLL_MAX_MS, std::max(POLL_MIN_MS, 4 * frameGapMs)))) {
-            lastPollMs = millis();
-            rx->poll();
+        } else if (pendingReqLen && !requestWaitMs()) {
+            sendRequestNow(pendingReq, pendingReqLen);
+        } else {
+            // A poll left unanswered (seeder silent or out of airtime) doubles the interval, up to a minute.
+            uint32_t interval = std::min(POLL_MAX_MS, std::max(POLL_MIN_MS, 4 * frameGapMs)) << std::min<uint8_t>(unansweredPolls, 5);
+            if (!pendingReqLen && Throttle::hasElapsed(lastPollMs, std::min(interval, POLL_BACKOFF_MAX_MS))) {
+                lastPollMs = millis();
+                if (unansweredPolls < 255)
+                    unansweredPolls++;
+                rx->poll();
+            }
         }
     }
     return 1000;

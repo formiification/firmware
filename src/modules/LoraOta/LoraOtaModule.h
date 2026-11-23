@@ -68,9 +68,6 @@ class LoraOtaModule : public SinglePortModule, private concurrency::OSThread, pr
         uint32_t lastRxMs = 0;
         uint32_t lastQueryMs = 0;
         uint32_t doneMs = 0;
-        uint32_t paceFromMs = 0; // when the last answered request went out
-        uint32_t paceGapMs = 0;  // its airtime stretched to RELAY_DUTY_PERCENT
-        uint32_t unitAirMs = 0;  // airtime of the frames sent for the current request
     };
 
     void send_frame(const uint8_t *data, size_t len) override;
@@ -100,6 +97,9 @@ class LoraOtaModule : public SinglePortModule, private concurrency::OSThread, pr
                         uint16_t total, uint8_t reject, uint8_t session);
     bool relayActive() const;
     void requestKey(NodeNum peer, uint8_t channel);
+    static uint32_t frameAirMs(size_t len);
+    uint32_t requestWaitMs() const;
+    void sendRequestNow(const uint8_t *data, size_t len);
 
     lora_ota::OtaStaging staging;
     ota_common::AdminKeyVerifier verifier;
@@ -121,6 +121,14 @@ class LoraOtaModule : public SinglePortModule, private concurrency::OSThread, pr
         uint32_t delayMs = 0;
     } pendingStatus;
     uint32_t lastNeighborQueryMs = 0;
+    // Receiver-side pacing: the next Request goes out only when the seeder's frames we received plus our own
+    // since the previous Request fit in rxDutyPermille of the time elapsed (the seeder just answers requests).
+    uint16_t rxDutyPermille = 35;
+    uint32_t reqFromMs = 0;
+    uint32_t reqAirMs = 0;
+    uint8_t pendingReq[32];
+    size_t pendingReqLen = 0;
+    uint8_t unansweredPolls = 0;
     NodeNum keyAsked = 0;
     uint32_t keyAskedMs = 0;
     uint8_t manifestBuf[256];
