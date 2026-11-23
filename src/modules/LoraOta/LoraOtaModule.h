@@ -14,11 +14,12 @@
 
 // Fork frame types on LORA_OTA_APP, after ota-common's 1..11.
 enum class LoraOtaExtFrame : uint8_t {
-    Query = 12,      // any -> node: reply with Status
+    Query = 12,      // any -> node: reply with Status (optional body: reply-to node, le32)
     Status = 13,     // node -> asker
     Activate = 14,   // admin -> node: install the Ready staged image (payload: sha256 + XEdDSA signature)
     SeedTo = 15,     // admin (PKI) -> node: seed the staged image to a 0-hop neighbour
     SeedReport = 16, // node -> admin: progress of that relay session
+    QueryNeighbors = 17, // admin (PKI) -> node: broadcast a 0-hop Query whose Status goes to the reply-to node
 };
 
 enum class RelayState : uint8_t {
@@ -76,7 +77,9 @@ class LoraOtaModule : public SinglePortModule, private concurrency::OSThread, pr
     void endSession();
     void afterFrame();
     void captureManifest(const ota_common::OtaFrameHeader &h, const uint8_t *p, size_t n);
-    void sendStatus(NodeNum to, uint8_t channel);
+    void sendStatus(NodeNum to, uint8_t channel, NodeNum via = 0, int8_t viaSnrQ = 0);
+    void handleQuery(const meshtastic_MeshPacket &mp, const uint8_t *p, size_t n);
+    void handleQueryNeighbors(const meshtastic_MeshPacket &mp, const uint8_t *p, size_t n);
     struct Verify;
     bool verifyStep();
     bool consumeOutput(Verify &v, const ota_common::Manifest &m, size_t n);
@@ -106,6 +109,15 @@ class LoraOtaModule : public SinglePortModule, private concurrency::OSThread, pr
     uint32_t lastFrameMs = 0;
     uint32_t lastPollMs = 0;
     uint32_t frameGapMs = 2000;
+    struct PendingStatus { // answer to a broadcast Query, delayed so neighbours don't all transmit at once
+        NodeNum to = 0;
+        uint8_t channel = 0;
+        NodeNum via = 0;
+        int8_t viaSnrQ = 0;
+        uint32_t setMs = 0;
+        uint32_t delayMs = 0;
+    } pendingStatus;
+    uint32_t lastNeighborQueryMs = 0;
     NodeNum keyAsked = 0;
     uint32_t keyAskedMs = 0;
     uint8_t manifestBuf[256];

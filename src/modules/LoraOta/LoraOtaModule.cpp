@@ -28,7 +28,11 @@ constexpr uint32_t POLL_MAX_MS = 30 * 1000;
 constexpr uint32_t GAP_INITIAL_MS = 2000;
 constexpr uint32_t SESSION_IDLE_MS = 10 * 60 * 1000;
 constexpr size_t VERIFY_IN_STEP = 8 * 1024;
-constexpr uint8_t STATUS_VERSION = 1;
+constexpr uint8_t STATUS_VERSION = 2; // 2: via + via SNR at 116
+constexpr size_t STATUS_LEN = 121;
+constexpr uint32_t NEIGHBOR_QUERY_INTERVAL_MS = 30 * 1000;
+constexpr uint32_t STATUS_JITTER_MIN_MS = 300;
+constexpr uint32_t STATUS_JITTER_MAX_MS = 4000;
 constexpr size_t FRAGMENT = 200; // leaves room for PKI overhead under the 233-byte payload cap
 constexpr uint32_t RELAY_START_RETRY_MS = 60 * 1000;
 constexpr uint32_t RELAY_SILENCE_MS = 15 * 60 * 1000;
@@ -151,9 +155,9 @@ bool LoraOtaModule::isAdminCommand(const meshtastic_MeshPacket &mp) const
     return false;
 }
 
-void LoraOtaModule::sendStatus(NodeNum to, uint8_t channel)
+void LoraOtaModule::sendStatus(NodeNum to, uint8_t channel, NodeNum via, int8_t viaSnrQ)
 {
-    uint8_t b[ota_common::kFrameHeaderLen + 116] = {0};
+    uint8_t b[ota_common::kFrameHeaderLen + STATUS_LEN] = {0};
     OtaFrameHeader h{static_cast<OtaFrameType>(LoraOtaExtFrame::Status), sessionId, 0, 0, 0};
     ota_common::frame_header_pack(h, b);
     uint8_t *p = b + ota_common::kFrameHeaderLen;
@@ -177,7 +181,49 @@ void LoraOtaModule::sendStatus(NodeNum to, uint8_t channel)
     strncpy(reinterpret_cast<char *>(p + 32), optstr(APP_ENV), 32);
     strncpy(reinterpret_cast<char *>(p + 64), optstr(APP_VERSION), 48);
     putLe32(p + 112, appStart()); // lets the panel check that a package fits before sending it
+    putLe32(p + 116, via);        // node whose 0-hop Query we answer (a remote neighbour query), else 0
+    p[120] = static_cast<uint8_t>(viaSnrQ); // SNR of that Query here, dB * 4
     sendTo(to, channel, b, sizeof(b), false);
+}
+
+void LoraOtaModule::handleQuery(const meshtastic_MeshPacket &mp, const uint8_t *p, size_t n)
+{
+    NodeNum to = mp.from, via = 0;
+    int8_t snrQ = 0;
+    if (n >= 4) { // relayed neighbour query: answer the node that asked for it, say whose broadcast we heard
+        NodeNum replyTo = (NodeNum)p[0] | (NodeNum)p[1] << 8 | (NodeNum)p[2] << 16 | (NodeNum)p[3] << 24;
+        if (replyTo && replyTo != nodeDB->getNodeNum()) {
+            to = replyTo;
+            via = mp.from;
+            float q = mp.rx_snr * 4;
+            snrQ = static_cast<int8_t>(q > 127 ? 127 : q < -128 ? -128 : q);
+            requestKey(to, mp.channel);
+        }
+    }
+    if (!isBroadcast(mp.to)) {
+        sendStatus(to, mp.channel, via, snrQ);
+        return;
+    }
+    pendingStatus = {to, mp.channel, via, snrQ, millis(), (uint32_t)random(STATUS_JITTER_MIN_MS, STATUS_JITTER_MAX_MS)};
+    setIntervalFromNow(pendingStatus.delayMs);
+}
+
+void LoraOtaModule::handleQueryNeighbors(const meshtastic_MeshPacket &mp, const uint8_t *p, size_t n)
+{
+    if (!isAdminCommand(mp)) {
+        LOG_WARN("LoRa OTA: QueryNeighbors from 0x%08x refused (not an admin key over PKI)", mp.from);
+        return;
+    }
+    if (lastNeighborQueryMs && Throttle::isWithinTimespanMs(lastNeighborQueryMs, NEIGHBOR_QUERY_INTERVAL_MS))
+        return;
+    lastNeighborQueryMs = millis();
+    NodeNum replyTo = n >= 4 ? (NodeNum)p[0] | (NodeNum)p[1] << 8 | (NodeNum)p[2] << 16 | (NodeNum)p[3] << 24 : mp.from;
+    uint8_t f[ota_common::kFrameHeaderLen + 4];
+    OtaFrameHeader h{static_cast<OtaFrameType>(LoraOtaExtFrame::Query), 0, 0, 0, 0};
+    ota_common::frame_header_pack(h, f);
+    putLe32(f + ota_common::kFrameHeaderLen, replyTo);
+    LOG_INFO("LoRa OTA: neighbour query for 0x%08x", replyTo);
+    sendTo(NODENUM_BROADCAST, mp.channel, f, sizeof(f), true);
 }
 
 void LoraOtaModule::startSession(const meshtastic_MeshPacket &mp, uint8_t session)
@@ -261,7 +307,11 @@ ProcessMessage LoraOtaModule::handleReceived(const meshtastic_MeshPacket &mp)
     requestKey(mp.from, mp.channel);
 
     if (type == static_cast<uint8_t>(LoraOtaExtFrame::Query)) {
-        sendStatus(mp.from, mp.channel);
+        handleQuery(mp, body, bodyLen);
+        return ProcessMessage::STOP;
+    }
+    if (type == static_cast<uint8_t>(LoraOtaExtFrame::QueryNeighbors)) {
+        handleQueryNeighbors(mp, body, bodyLen);
         return ProcessMessage::STOP;
     }
     if (type == static_cast<uint8_t>(LoraOtaExtFrame::SeedTo)) {
@@ -611,6 +661,11 @@ bool LoraOtaModule::verifyStep()
 
 int32_t LoraOtaModule::runOnce()
 {
+    if (pendingStatus.to && !Throttle::isWithinTimespanMs(pendingStatus.setMs, pendingStatus.delayMs)) {
+        PendingStatus s = pendingStatus;
+        pendingStatus.to = 0;
+        sendStatus(s.to, s.channel, s.via, s.viaSnrQ);
+    }
     if (phase == Phase::Verifying) {
         if (!verifyStep()) {
             verify.reset();
