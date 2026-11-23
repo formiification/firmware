@@ -136,7 +136,8 @@ void LoraOtaModule::requestKey(NodeNum peer, uint8_t channel)
     keyAsked = peer;
     keyAskedMs = millis();
     LOG_INFO("LoRa OTA: no public key for 0x%08x, requesting its NodeInfo", peer);
-    nodeInfoModule->sendOurNodeInfo(peer, true, channel);
+    // Short timeout: the routine path skips a NodeInfo sent in the last ~30 min, e.g. the one sent at boot.
+    nodeInfoModule->sendOurNodeInfo(peer, true, channel, true);
 #else
     (void)peer;
     (void)channel;
