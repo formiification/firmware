@@ -24,10 +24,18 @@ struct FlashLock {
     ~FlashLock() { FSCom._unlockFS(); }
 };
 
-bool strFieldEq(const char *field, size_t fieldLen, const char *s)
+// Board part of an env name: everything before the first '-' ("rak4631-tiny-router-sht" -> "rak4631").
+size_t boardLen(const char *env, size_t n)
 {
-    size_t n = strnlen(field, fieldLen);
-    return n == strlen(s) && memcmp(field, s, n) == 0;
+    const char *dash = static_cast<const char *>(memchr(env, '-', n));
+    return dash ? static_cast<size_t>(dash - env) : n;
+}
+
+// Any build of the same board is accepted (an admin-signed variant change); the manifest keeps the image's real env.
+bool sameBoard(const char *field, size_t fieldLen, const char *env)
+{
+    size_t a = boardLen(field, strnlen(field, fieldLen)), b = boardLen(env, strlen(env));
+    return a > 0 && a == b && memcmp(field, env, a) == 0;
 }
 } // namespace
 
@@ -52,11 +60,11 @@ uint32_t OtaStaging::crc32(const uint8_t *p, size_t n)
     return ~c;
 }
 
-Reject OtaStaging::check(const ota_common::Manifest &m, bool checkEnv)
+Reject OtaStaging::check(const ota_common::Manifest &m)
 {
     if ((m.flags & ota_common::kManifestFlagDelta) || !(m.flags & FLAG_LZMA2))
         return Reject::NotFullLzma;
-    if (checkEnv && !strFieldEq(m.env, sizeof(m.env), optstr(APP_ENV)))
+    if (!sameBoard(m.env, sizeof(m.env), optstr(APP_ENV)))
         return Reject::WrongEnv;
     if (m.block_size == 0 || m.block_size > 4096 || m.block_count == 0 ||
         (uint64_t)m.block_size * m.block_count < m.payload_length ||
@@ -80,7 +88,7 @@ void OtaStaging::load()
         memset(&meta_, 0, sizeof(meta_));
         return;
     }
-    if (check(meta_.manifest, meta_.state != StagingState::Installed) != Reject::None)
+    if (check(meta_.manifest) != Reject::None)
         memset(&meta_, 0, sizeof(meta_));
 }
 

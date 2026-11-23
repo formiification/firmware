@@ -33,7 +33,7 @@ enum class StagingState : uint32_t {
 enum class Reject : uint8_t {
     None = 0,
     NotFullLzma = 1,
-    WrongEnv = 2,
+    WrongEnv = 2, // built for another board (env prefix before the first '-')
     TooBig = 3,
     Geometry = 4,
     BadSignature = 5, // set by the module: OtaReceiver aborted on the manifest
@@ -73,8 +73,7 @@ class OtaStaging final : public ota_common::IBlockStore
     void setState(StagingState s);
     void flush();
 
-    // checkEnv=false: an Installed image may carry the env of the build it replaced (variant change).
-    static Reject check(const ota_common::Manifest &m, bool checkEnv = true);
+    static Reject check(const ota_common::Manifest &m);
 
   private:
     static constexpr uint32_t META_MAGIC = 0x4D544F4C; // "LOTM"
