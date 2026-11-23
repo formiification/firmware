@@ -10,6 +10,7 @@
 #include "main.h"
 #include "airtime.h"
 #include "modules/NodeInfoModule.h"
+#include "RadioLibInterface.h"
 #include "mesh/Throttle.h"
 #include "ota_common/sha256.h"
 #include <algorithm>
@@ -38,6 +39,10 @@ constexpr uint32_t RELAY_START_RETRY_MS = 60 * 1000;
 constexpr uint32_t RELAY_SILENCE_MS = 15 * 60 * 1000;
 constexpr uint32_t RELAY_VERIFY_WAIT_MS = 5 * 60 * 1000;
 constexpr uint32_t KEY_REQUEST_INTERVAL_MS = 60 * 1000;
+// A relay paces its frames to this share of airtime, under the firmware's polite limit (half the region's
+// duty cycle, 5 % in EU868): unpaced it answers every request at once and then stalls for most of an hour.
+constexpr uint32_t RELAY_DUTY_PERCENT = 4;
+constexpr uint32_t PACKET_OVERHEAD = 16 + 12 + 6; // header, PKI tag/nonce, Data protobuf around our payload
 constexpr uint32_t INSTALL_REBOOT_DELAY_MS = 3000; // lets the Installing status leave the radio
 const char ACTIVATE_TAG[] = "LOTA-ACTIVATE";
 
@@ -431,6 +436,7 @@ void LoraOtaModule::handleSeedTo(const meshtastic_MeshPacket &mp, const uint8_t 
     relay.lastReportDecile = 0;
     relay.state = RelayState::Starting;
     relay.startedMs = relay.lastRxMs = millis();
+    relay.paceGapMs = 0;
     relay.lastStartMs = 0;
     relay.doneMs = 0;
     requestKey(target, channel); // relay frames to the target are DMs too
@@ -452,6 +458,8 @@ void LoraOtaModule::relaySendUnit(uint8_t type, uint16_t index, const uint8_t *d
         ota_common::frame_header_pack(h, f);
         memcpy(f + ota_common::kFrameHeaderLen, data + off, n);
         sendTo(relay.target, relay.channel, f, ota_common::kFrameHeaderLen + n, true);
+        if (RadioLibInterface::instance)
+            relay.unitAirMs += RadioLibInterface::instance->getPacketTime(ota_common::kFrameHeaderLen + n + PACKET_OVERHEAD);
     }
 }
 
@@ -479,6 +487,9 @@ void LoraOtaModule::relayFrame(const OtaFrameHeader &h, const uint8_t *p, size_t
             LOG_DEBUG("LoRa OTA: relay paused, airtime budget used"); // the target re-requests after its poll
             return;
         }
+        if (relay.paceGapMs && Throttle::isWithinTimespanMs(relay.paceFromMs, relay.paceGapMs))
+            return; // pacing: the target asks again after its poll interval
+        relay.unitAirMs = 0;
         if (h.index == ota_common::kIndexManifest) {
             uint8_t unit[sizeof(ota_common::Manifest) + 64];
             memcpy(unit, &m, sizeof(m));
@@ -493,6 +504,8 @@ void LoraOtaModule::relayFrame(const OtaFrameHeader &h, const uint8_t *p, size_t
             relaySendUnit(static_cast<uint8_t>(OtaFrameType::Block), h.index,
                           reinterpret_cast<const uint8_t *>(staging.stagingStart()) + off, blen);
         }
+        relay.paceFromMs = millis();
+        relay.paceGapMs = relay.unitAirMs * 100 / RELAY_DUTY_PERCENT;
         break;
     case OtaFrameType::Ack:
         if (h.index < relay.acked.size() && !relay.acked[h.index]) {

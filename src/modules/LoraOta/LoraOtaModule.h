@@ -68,6 +68,9 @@ class LoraOtaModule : public SinglePortModule, private concurrency::OSThread, pr
         uint32_t lastRxMs = 0;
         uint32_t lastQueryMs = 0;
         uint32_t doneMs = 0;
+        uint32_t paceFromMs = 0; // when the last answered request went out
+        uint32_t paceGapMs = 0;  // its airtime stretched to RELAY_DUTY_PERCENT
+        uint32_t unitAirMs = 0;  // airtime of the frames sent for the current request
     };
 
     void send_frame(const uint8_t *data, size_t len) override;
