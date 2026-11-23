@@ -109,8 +109,9 @@ void LoraOtaModule::sendTo(NodeNum to, uint8_t channel, const uint8_t *data, siz
     }
     p->to = to;
     p->channel = channel;
-    if (zeroHop)
-        p->hop_limit = 0; // bulk transfer frames never flood
+    int hops = zeroHop ? 0 : hopsTo(to);
+    if (hops >= 0)
+        p->hop_limit = hops; // bulk frames never flood; replies go no further than the asker is
     p->want_ack = false;
     p->decoded.payload.size = len;
     memcpy(p->decoded.payload.bytes, data, len);
@@ -182,6 +183,28 @@ void LoraOtaModule::requestKey(NodeNum peer, uint8_t channel)
     (void)peer;
     (void)channel;
 #endif
+}
+
+void LoraOtaModule::noteHops(const meshtastic_MeshPacket &mp)
+{
+    if (mp.hop_start < mp.hop_limit)
+        return;
+    uint8_t hops = mp.hop_start - mp.hop_limit;
+    for (auto &e : peerHops)
+        if (e.node == mp.from) {
+            e.hops = hops;
+            return;
+        }
+    peerHops[peerHopsNext] = {mp.from, hops};
+    peerHopsNext = (peerHopsNext + 1) % (sizeof(peerHops) / sizeof(peerHops[0]));
+}
+
+int LoraOtaModule::hopsTo(NodeNum peer) const
+{
+    for (const auto &e : peerHops)
+        if (e.node == peer && peer)
+            return e.hops;
+    return -1; // unknown: the node's default hop limit
 }
 
 bool LoraOtaModule::isAdminCommand(const meshtastic_MeshPacket &mp) const
@@ -349,6 +372,7 @@ ProcessMessage LoraOtaModule::handleReceived(const meshtastic_MeshPacket &mp)
     const uint8_t *body = data + ota_common::kFrameHeaderLen;
     size_t bodyLen = len - ota_common::kFrameHeaderLen;
     uint8_t type = static_cast<uint8_t>(h.type);
+    noteHops(mp);
     requestKey(mp.from, mp.channel);
 
     if (type == static_cast<uint8_t>(LoraOtaExtFrame::Query)) {

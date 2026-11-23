@@ -97,6 +97,8 @@ class LoraOtaModule : public SinglePortModule, private concurrency::OSThread, pr
                         uint16_t total, uint8_t reject, uint8_t session);
     bool relayActive() const;
     void requestKey(NodeNum peer, uint8_t channel);
+    void noteHops(const meshtastic_MeshPacket &mp);
+    int hopsTo(NodeNum peer) const;
     static uint32_t frameAirMs(size_t len);
     uint32_t requestWaitMs() const;
     void sendRequestNow(const uint8_t *data, size_t len);
@@ -129,6 +131,11 @@ class LoraOtaModule : public SinglePortModule, private concurrency::OSThread, pr
     uint8_t pendingReq[32];
     size_t pendingReqLen = 0;
     uint8_t unansweredPolls = 0;
+    struct PeerHops { // hops the last packet from a peer travelled: our replies to it use exactly that
+        NodeNum node = 0;
+        uint8_t hops = 0;
+    } peerHops[8];
+    uint8_t peerHopsNext = 0;
     NodeNum keyAsked = 0;
     uint32_t keyAskedMs = 0;
     uint8_t manifestBuf[256];
