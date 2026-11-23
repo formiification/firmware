@@ -52,11 +52,11 @@ uint32_t OtaStaging::crc32(const uint8_t *p, size_t n)
     return ~c;
 }
 
-Reject OtaStaging::check(const ota_common::Manifest &m)
+Reject OtaStaging::check(const ota_common::Manifest &m, bool checkEnv)
 {
     if ((m.flags & ota_common::kManifestFlagDelta) || !(m.flags & FLAG_LZMA2))
         return Reject::NotFullLzma;
-    if (!strFieldEq(m.env, sizeof(m.env), optstr(APP_ENV)))
+    if (checkEnv && !strFieldEq(m.env, sizeof(m.env), optstr(APP_ENV)))
         return Reject::WrongEnv;
     if (m.block_size == 0 || m.block_size > 4096 || m.block_count == 0 ||
         (uint64_t)m.block_size * m.block_count < m.payload_length ||
@@ -80,7 +80,7 @@ void OtaStaging::load()
         memset(&meta_, 0, sizeof(meta_));
         return;
     }
-    if (check(meta_.manifest) != Reject::None)
+    if (check(meta_.manifest, meta_.state != StagingState::Installed) != Reject::None)
         memset(&meta_, 0, sizeof(meta_));
 }
 

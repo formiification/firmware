@@ -9,6 +9,7 @@
 #include "UptimeClock.h"
 #include "main.h"
 #include "airtime.h"
+#include "modules/NodeInfoModule.h"
 #include "mesh/Throttle.h"
 #include "ota_common/sha256.h"
 #include <algorithm>
@@ -32,6 +33,7 @@ constexpr size_t FRAGMENT = 200; // leaves room for PKI overhead under the 233-b
 constexpr uint32_t RELAY_START_RETRY_MS = 60 * 1000;
 constexpr uint32_t RELAY_SILENCE_MS = 15 * 60 * 1000;
 constexpr uint32_t RELAY_VERIFY_WAIT_MS = 5 * 60 * 1000;
+constexpr uint32_t KEY_REQUEST_INTERVAL_MS = 60 * 1000;
 constexpr uint32_t INSTALL_REBOOT_DELAY_MS = 3000; // lets the Installing status leave the radio
 const char ACTIVATE_TAG[] = "LOTA-ACTIVATE";
 
@@ -115,6 +117,26 @@ void LoraOtaModule::sendSimple(NodeNum to, uint8_t channel, uint8_t type, uint8_
 void LoraOtaModule::send_frame(const uint8_t *data, size_t len)
 {
     sendTo(seeder, seederChannel, data, len, true);
+}
+
+// Our replies are DMs, and the router refuses a DM to a node whose public key it lacks (only traceroute,
+// NodeInfo, position and routing are exempt). Swap NodeInfo so the peer's next retry gets an answer.
+void LoraOtaModule::requestKey(NodeNum peer, uint8_t channel)
+{
+#if !MESHTASTIC_EXCLUDE_PKI
+    meshtastic_NodeInfoLite_public_key_t key;
+    if (!nodeInfoModule || isBroadcast(peer) || nodeDB->copyPublicKey(peer, key))
+        return;
+    if (peer == keyAsked && Throttle::isWithinTimespanMs(keyAskedMs, KEY_REQUEST_INTERVAL_MS))
+        return;
+    keyAsked = peer;
+    keyAskedMs = millis();
+    LOG_INFO("LoRa OTA: no public key for 0x%08x, requesting its NodeInfo", peer);
+    nodeInfoModule->sendOurNodeInfo(peer, true, channel);
+#else
+    (void)peer;
+    (void)channel;
+#endif
 }
 
 bool LoraOtaModule::isAdminCommand(const meshtastic_MeshPacket &mp) const
@@ -236,6 +258,7 @@ ProcessMessage LoraOtaModule::handleReceived(const meshtastic_MeshPacket &mp)
     const uint8_t *body = data + ota_common::kFrameHeaderLen;
     size_t bodyLen = len - ota_common::kFrameHeaderLen;
     uint8_t type = static_cast<uint8_t>(h.type);
+    requestKey(mp.from, mp.channel);
 
     if (type == static_cast<uint8_t>(LoraOtaExtFrame::Query)) {
         sendStatus(mp.from, mp.channel);
@@ -359,6 +382,7 @@ void LoraOtaModule::handleSeedTo(const meshtastic_MeshPacket &mp, const uint8_t 
     relay.startedMs = relay.lastRxMs = millis();
     relay.lastStartMs = 0;
     relay.doneMs = 0;
+    requestKey(target, channel); // relay frames to the target are DMs too
     LOG_INFO("LoRa OTA: seeding staged image to 0x%08x for 0x%08x", target, mp.from);
     relayReport(true);
     setIntervalFromNow(0);

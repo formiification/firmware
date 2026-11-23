@@ -73,7 +73,8 @@ class OtaStaging final : public ota_common::IBlockStore
     void setState(StagingState s);
     void flush();
 
-    static Reject check(const ota_common::Manifest &m);
+    // checkEnv=false: an Installed image may carry the env of the build it replaced (variant change).
+    static Reject check(const ota_common::Manifest &m, bool checkEnv = true);
 
   private:
     static constexpr uint32_t META_MAGIC = 0x4D544F4C; // "LOTM"

@@ -93,6 +93,7 @@ class LoraOtaModule : public SinglePortModule, private concurrency::OSThread, pr
     void sendSeedReport(NodeNum to, uint8_t channel, NodeNum target, RelayState state, uint8_t targetPhase, uint16_t acked,
                         uint16_t total, uint8_t reject, uint8_t session);
     bool relayActive() const;
+    void requestKey(NodeNum peer, uint8_t channel);
 
     lora_ota::OtaStaging staging;
     ota_common::AdminKeyVerifier verifier;
@@ -105,6 +106,8 @@ class LoraOtaModule : public SinglePortModule, private concurrency::OSThread, pr
     uint32_t lastFrameMs = 0;
     uint32_t lastPollMs = 0;
     uint32_t frameGapMs = 2000;
+    NodeNum keyAsked = 0;
+    uint32_t keyAskedMs = 0;
     uint8_t manifestBuf[256];
     uint16_t manifestFill = 0;
 
