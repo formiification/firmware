@@ -352,8 +352,8 @@ void NodeListCmdModule::handleVersion(const meshtastic_MeshPacket &mp)
     n += snprintf(msg + n, sizeof(msg) - n, "BL %s (0x%06lx) @0x%05lx\nSD FWID 0x%04x", bl, (unsigned long)bootloaderVersion,
                   (unsigned long)NRF_UICR->NRFFW[0], SD_FWID_GET(MBR_SIZE));
     if (sdv != SDM_INFO_FIELD_INVALID)
-        n += snprintf(msg + n, sizeof(msg) - n, " v%lu.%lu.%lu", (unsigned long)(sdv / 1000000), (unsigned long)(sdv / 1000 % 1000),
-                      (unsigned long)(sdv % 1000));
+        n += snprintf(msg + n, sizeof(msg) - n, " v%lu.%lu.%lu", (unsigned long)(sdv / 1000000),
+                      (unsigned long)(sdv / 1000 % 1000), (unsigned long)(sdv % 1000));
     n += snprintf(msg + n, sizeof(msg) - n, "\n");
 #endif
     snprintf(msg + n, sizeof(msg) - n, "FW %s %s", optstr(APP_VERSION), optstr(APP_ENV));
