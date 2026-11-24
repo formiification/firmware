@@ -35,6 +35,7 @@ class NodeListCmdModule : public SinglePortModule, private concurrency::OSThread
     void startList(const meshtastic_MeshPacket &mp, ListKind kind, const char *arg);
     void handleFlag(const meshtastic_MeshPacket &mp, ListKind kind, bool set, const char *arg);
     void handleNodeInfo(const meshtastic_MeshPacket &mp, const char *arg);
+    void handleVersion(const meshtastic_MeshPacket &mp);
     void sendText(NodeNum to, const uint8_t *key, const char *text);
 };
 

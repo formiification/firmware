@@ -13,6 +13,11 @@
 #include "modules/NodeInfoModule.h"
 #endif
 
+#ifdef ARCH_NRF52
+#include <nrf.h>
+#include <nrf_mbr.h>
+#include <nrf_sdm.h>
+#endif
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -134,10 +139,11 @@ ProcessMessage NodeListCmdModule::handleReceived(const meshtastic_MeshPacket &mp
         handleFlag(mp, ListKind::IGNORED, false, arg);
     else if ((arg = matchCommand(buf, "!nodeinfo")))
         handleNodeInfo(mp, arg);
+    else if (matchCommand(buf, "!ver"))
+        handleVersion(mp);
     else if (matchCommand(buf, "!help"))
         sendText(mp.from, mp.public_key.bytes,
-                 "!list_favorites [page]\n!list_ignored [page]\n!addfav ID\n!unfav ID\n!addign ID\n!unignore ID\n"
-                 "!nodeinfo ID (exchange NodeInfo with ID)\n!help");
+                 "!list_favorites|!list_ignored [page]\n!addfav|!unfav|!addign|!unignore ID\n!nodeinfo ID\n!ver\n!help");
 
     return ProcessMessage::CONTINUE;
 }
@@ -307,6 +313,50 @@ void NodeListCmdModule::handleNodeInfo(const meshtastic_MeshPacket &mp, const ch
         snprintf(msg, sizeof(msg), "SKIP nodeinfo -> !%08x (sent <60s ago or channel busy)", num);
     }
 #endif
+    sendText(mp.from, mp.public_key.bytes, msg);
+}
+
+#ifdef ARCH_NRF52
+// Adafruit/OTAFIX bootloaders embed INFO_UF2 ("UF2 Bootloader <version> lib/..."); copy the version token.
+static void bootloaderString(char *out, size_t outLen)
+{
+    static const char tag[] = "UF2 Bootloader ";
+    const size_t tagLen = sizeof(tag) - 1;
+    uint32_t start = NRF_UICR->NRFFW[0], end = 0xFE000; // bootloader up to the MBR params page
+    snprintf(out, outLen, "unknown");
+    if (start == 0xFFFFFFFF || start >= end)
+        return;
+    const char *p = reinterpret_cast<const char *>(start), *last = reinterpret_cast<const char *>(end - tagLen);
+    for (; p < last; p++) {
+        if (*p != 'U' || memcmp(p, tag, tagLen) != 0)
+            continue;
+        p += tagLen;
+        size_t n = 0;
+        while (n + 1 < outLen && p + n < reinterpret_cast<const char *>(end) && p[n] > ' ' && p[n] < 0x7F)
+            n++;
+        memcpy(out, p, n);
+        out[n] = '\0';
+        return;
+    }
+}
+#endif
+
+void NodeListCmdModule::handleVersion(const meshtastic_MeshPacket &mp)
+{
+    char msg[MAX_REPLY_LEN];
+    size_t n = 0;
+#ifdef ARCH_NRF52
+    char bl[48];
+    bootloaderString(bl, sizeof(bl));
+    uint32_t sdv = SD_VERSION_GET(MBR_SIZE);
+    n += snprintf(msg + n, sizeof(msg) - n, "BL %s (0x%06lx) @0x%05lx\nSD FWID 0x%04x", bl, (unsigned long)bootloaderVersion,
+                  (unsigned long)NRF_UICR->NRFFW[0], SD_FWID_GET(MBR_SIZE));
+    if (sdv != SDM_INFO_FIELD_INVALID)
+        n += snprintf(msg + n, sizeof(msg) - n, " v%lu.%lu.%lu", (unsigned long)(sdv / 1000000), (unsigned long)(sdv / 1000 % 1000),
+                      (unsigned long)(sdv % 1000));
+    n += snprintf(msg + n, sizeof(msg) - n, "\n");
+#endif
+    snprintf(msg + n, sizeof(msg) - n, "FW %s %s", optstr(APP_VERSION), optstr(APP_ENV));
     sendText(mp.from, mp.public_key.bytes, msg);
 }
 
