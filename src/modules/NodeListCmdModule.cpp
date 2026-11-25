@@ -356,7 +356,23 @@ void NodeListCmdModule::handleVersion(const meshtastic_MeshPacket &mp)
                       (unsigned long)(sdv / 1000 % 1000), (unsigned long)(sdv % 1000));
     n += snprintf(msg + n, sizeof(msg) - n, "\n");
 #endif
-    snprintf(msg + n, sizeof(msg) - n, "FW %s %s", optstr(APP_VERSION), optstr(APP_ENV));
+    n += snprintf(msg + n, sizeof(msg) - n, "FW %s %s\n", optstr(APP_VERSION), optstr(APP_ENV));
+    uint32_t up = Time::getUptimeSecs();
+    n += snprintf(msg + n, sizeof(msg) - n, "up %lud %02luh%02lum", (unsigned long)(up / 86400), (unsigned long)(up / 3600 % 24),
+                  (unsigned long)(up / 60 % 60));
+#ifdef ARCH_ESP32
+    snprintf(msg + n, sizeof(msg) - n, ", boots %lu", (unsigned long)myNodeInfo.reboot_count);
+#elif defined(ARCH_NRF52)
+    // nRF52 keeps no boot counter; RESETREAS (cached by the core) says why it last restarted.
+    uint32_t why = readResetReason();
+    const char *cause = why & 0x1       ? "pin"
+                        : why & 0x2     ? "watchdog"
+                        : why & 0x4     ? "soft"
+                        : why & 0x8     ? "lockup"
+                        : why & 0x10000 ? "wake"
+                                        : "power-on";
+    snprintf(msg + n, sizeof(msg) - n, ", reset %s", cause);
+#endif
     sendText(mp.from, mp.public_key.bytes, msg);
 }
 
