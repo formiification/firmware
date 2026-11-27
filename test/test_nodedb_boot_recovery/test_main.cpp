@@ -244,7 +244,8 @@ static void test_absentConfig_takesFreshInstallPath(void)
 
     // No usable contents to protect, so this is NOT the frozen path.
     TEST_ASSERT_FALSE(NodeDBTestShim::decodeFailed(nodeDB));
-    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RegionCode_UNSET, config.lora.region);
+    // Defaults again: the fork installs EU_868 (0e744b6), upstream UNSET.
+    TEST_ASSERT_EQUAL(meshtastic_Config_LoRaConfig_RegionCode_EU_868, config.lora.region);
 
     // Re-arm keygen (region gate) and reboot into the replacement identity.
     establishHealthyBaseline(); // re-captures the baseline for the remaining tests

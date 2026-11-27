@@ -91,35 +91,35 @@ void test_hostile_hop_start_wraps_negative_falls_back_to_configured_limit(void)
 }
 
 // ===========================================================================
-// Group 2 - known hop distance: hopsUsed + 2 margin, its clamp boundary, and
-// the intentionally uncapped long-path branch.
+// Group 2 - known hop distance: hopsUsed + 4 margin (the fork's wider margin, 0e744b6; upstream +2),
+// its clamp boundary, and the intentionally uncapped long-path branch (hopsUsed + 2).
 // ===========================================================================
 
-void test_direct_neighbor_response_gets_two_hop_margin(void)
+void test_direct_neighbor_response_gets_four_hop_margin(void)
 {
     config.lora.hop_limit = 7;
     auto request = makeRequest(3, 3); // 0 hops used
-    TEST_ASSERT_EQUAL_UINT8(2, testRoutingModule->getHopLimitForResponse(request));
+    TEST_ASSERT_EQUAL_UINT8(4, testRoutingModule->getHopLimitForResponse(request));
 }
 
-void test_two_hops_used_gets_margin_of_two(void)
+void test_two_hops_used_gets_margin_of_four(void)
 {
     config.lora.hop_limit = 7;
     auto request = makeRequest(3, 1); // 2 hops used
-    TEST_ASSERT_EQUAL_UINT8(4, testRoutingModule->getHopLimitForResponse(request));
+    TEST_ASSERT_EQUAL_UINT8(6, testRoutingModule->getHopLimitForResponse(request));
 }
 
 void test_margin_just_below_boundary_still_applies(void)
 {
     config.lora.hop_limit = 7;
-    auto request = makeRequest(7, 3); // 4 hops used: 4 + 2 = 6 < 7
+    auto request = makeRequest(7, 5); // 2 hops used: 2 + 4 = 6 < 7
     TEST_ASSERT_EQUAL_UINT8(6, testRoutingModule->getHopLimitForResponse(request));
 }
 
 void test_margin_at_boundary_clamps_to_configured_limit(void)
 {
     config.lora.hop_limit = 7;
-    auto request = makeRequest(7, 2); // 5 hops used: 5 + 2 == 7, not < 7 -> clamp
+    auto request = makeRequest(7, 4); // 3 hops used: 3 + 4 == 7, not < 7 -> clamp
     TEST_ASSERT_EQUAL_UINT8(7, testRoutingModule->getHopLimitForResponse(request));
 }
 
@@ -133,9 +133,9 @@ void test_hops_equal_to_limit_returns_limit(void)
 void test_long_path_exceeds_configured_limit_uncapped(void)
 {
     // Intentional exceed: a request that took more hops than our configured limit gets a
-    // response with the same hop count, otherwise the reply dies short of the requester.
+    // response with its hop count plus 2, otherwise the reply dies short of the requester.
     auto request = makeRequest(7, 0); // 7 hops used, configured limit 3
-    TEST_ASSERT_EQUAL_UINT8(7, testRoutingModule->getHopLimitForResponse(request));
+    TEST_ASSERT_EQUAL_UINT8(9, testRoutingModule->getHopLimitForResponse(request));
 }
 
 // ===========================================================================
@@ -172,11 +172,11 @@ void test_config_zero_yields_zero_for_unknown_hops(void)
 
 void test_config_zero_known_hops_returns_hops_used(void)
 {
-    // With a zero configured limit, any known hop count is "more than the limit" and is used
-    // as-is - a zero config does not strand replies to multi-hop requesters.
+    // With a zero configured limit, any known hop count is "more than the limit" and gets the
+    // over-limit margin - a zero config does not strand replies to multi-hop requesters.
     config.lora.hop_limit = 0;
     auto request = makeRequest(3, 1); // 2 hops used
-    TEST_ASSERT_EQUAL_UINT8(2, testRoutingModule->getHopLimitForResponse(request));
+    TEST_ASSERT_EQUAL_UINT8(4, testRoutingModule->getHopLimitForResponse(request));
 }
 
 // ===========================================================================
@@ -186,7 +186,7 @@ void test_config_zero_known_hops_returns_hops_used(void)
 void test_setreplyto_stamps_computed_hop_limit_and_reply_fields(void)
 {
     config.lora.hop_limit = 7;
-    auto request = makeRequest(3, 1); // 2 hops used -> response hop limit 4
+    auto request = makeRequest(3, 1); // 2 hops used -> response hop limit 6
     request.channel = 2;
     request.want_ack = true;
 
@@ -195,7 +195,7 @@ void test_setreplyto_stamps_computed_hop_limit_and_reply_fields(void)
 
     TEST_ASSERT_EQUAL_HEX32(kRequester, reply.to);
     TEST_ASSERT_EQUAL_UINT8(2, reply.channel);
-    TEST_ASSERT_EQUAL_UINT8(4, reply.hop_limit);
+    TEST_ASSERT_EQUAL_UINT8(6, reply.hop_limit);
     TEST_ASSERT_TRUE(reply.want_ack);
     TEST_ASSERT_EQUAL_HEX32(request.id, reply.decoded.request_id);
     TEST_ASSERT_EQUAL(meshtastic_MeshPacket_Priority_RELIABLE, reply.priority);
@@ -232,8 +232,8 @@ void setup()
     RUN_TEST(test_hostile_hop_start_wraps_negative_falls_back_to_configured_limit);
 
     printf("\n=== known hop distance: margin, clamp, uncapped long path ===\n");
-    RUN_TEST(test_direct_neighbor_response_gets_two_hop_margin);
-    RUN_TEST(test_two_hops_used_gets_margin_of_two);
+    RUN_TEST(test_direct_neighbor_response_gets_four_hop_margin);
+    RUN_TEST(test_two_hops_used_gets_margin_of_four);
     RUN_TEST(test_margin_just_below_boundary_still_applies);
     RUN_TEST(test_margin_at_boundary_clamps_to_configured_limit);
     RUN_TEST(test_hops_equal_to_limit_returns_limit);
